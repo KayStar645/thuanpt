@@ -1,0 +1,89 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Môi trường ảo
+venv/
+env/
+ENV/
+.env
+.venv
+env.bak/
+venv.bak/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+.project
+.pydevproject
+.settings/
+
+# Logs và dữ liệu
+*.log
+logs/
+*.sqlite3
+*.db
+
+# Dữ liệu và model
+src/data/origin/*
+src/data/processed/*
+src/data/predictions/*
+!src/data/origin/.gitkeep
+!src/data/processed/.gitkeep
+!src/data/predictions/.gitkeep
+
+# Model đã huấn luyện
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.h5
+*.hdf5
+*.model
+*.joblib
+
+# Embeddings và Knowledge Graph
+src/embeddings/*.npy
+src/embeddings/*.json
+src/kg/*.json
+src/kg/*.npy
+
+# Cache
+.cache/
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Các file tạm thời
+*.tmp
+*.bak
+*.swp
+*~ 
