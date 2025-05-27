@@ -6,7 +6,7 @@ import json
 import logging
 import torch
 from torch.utils.data import Dataset
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoTokenizer, AutoModel, PreTrainedTokenizer
 
 # Thiết lập logging
 logging.basicConfig(level=logging.INFO)
@@ -137,3 +137,28 @@ class ABSADataset(Dataset):
             labels = labels[:self.max_length]
         
         return input_embeds, attention_mask, labels 
+
+    def collate_fn(self, batch: list) -> dict:
+        """Hàm để gộp các mẫu thành batch.
+        
+        Args:
+            batch (list): Danh sách các mẫu
+            
+        Returns:
+            dict: Dictionary chứa batched tensors
+        """
+        # Stack các tensors
+        input_ids = torch.stack([item[0] for item in batch])
+        attention_mask = torch.stack([item[1] for item in batch])
+        labels = torch.stack([item[2] for item in batch])
+        
+        # Log batch shapes
+        logger.debug(f"Batch shapes - input_ids: {input_ids.shape}, "
+                    f"attention_mask: {attention_mask.shape}, "
+                    f"labels: {labels.shape}")
+        
+        return {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            'labels': labels
+        } 

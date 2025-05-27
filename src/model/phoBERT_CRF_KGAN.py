@@ -20,8 +20,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class PhoBERT_CRF_KGAN(nn.Module):
-    """Mô hình PhoBERT-CRF-KGAN cho bài toán ABSA.
-    
+    """
+    Mô hình PhoBERT-CRF-KGAN cho bài toán ABSA.
+
     Kiến trúc:
     1. PhoBERT (fine-tune 4 layer cuối)
     2. Knowledge Graph Attention Network
@@ -29,7 +30,7 @@ class PhoBERT_CRF_KGAN(nn.Module):
     4. Point-wise Feed Forward Network
     5. BiLSTM
     6. CRF layer
-    
+
     Args:
         bert_model_name (str): Tên mô hình BERT (mặc định: "vinai/phobert-base")
         num_labels (int): Số lượng nhãn (không bao gồm START và END)
@@ -45,7 +46,6 @@ class PhoBERT_CRF_KGAN(nn.Module):
         warmup_steps (int): Số bước warmup cho learning rate (mặc định: 0)
         early_stopping_patience (int): Số epoch chờ trước khi early stopping (mặc định: 3)
     """
-    
     def __init__(
         self,
         bert_model_name="vinai/phobert-base",
@@ -63,11 +63,10 @@ class PhoBERT_CRF_KGAN(nn.Module):
         early_stopping_patience=3
     ):
         super().__init__()
-        
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         logger.info(f"Khởi tạo PhoBERT_CRF_KGAN trên {self.device}")
-        
-        # Lưu các tham số
+
+        # Lưu các tham số cấu hình
         self.bert_hidden_size = bert_hidden_size
         self.kg_hidden_size = kg_hidden_size
         self.lstm_hidden_size = lstm_hidden_size
@@ -78,77 +77,76 @@ class PhoBERT_CRF_KGAN(nn.Module):
         self.max_grad_norm = max_grad_norm
         self.warmup_steps = warmup_steps
         self.early_stopping_patience = early_stopping_patience
-        
-        # Load BERT
+
+        # Log số lượng nhãn
+        logger.info(f"Số lượng nhãn (không bao gồm START/END): {num_labels}")
+        logger.info(f"Tổng số nhãn (bao gồm START/END): {num_labels + 2}")
+
+        # 1. PhoBERT
         self.bert = AutoModel.from_pretrained(bert_model_name)
         self.tokenizer = AutoTokenizer.from_pretrained(bert_model_name)
-        
-        # Projection layer để chuyển đổi BERT embeddings sang KG embeddings
+
+        # 2. KG projection + KG attention
         self.kg_projection = nn.Linear(bert_hidden_size, kg_hidden_size)
-        
-        # 2. Knowledge Graph Attention Network
         self.kg_attention = KGAttention(
             input_size=kg_hidden_size,
             hidden_size=kg_hidden_size,
             dropout=dropout,
             attention_dropout=dropout
         )
-        
-        # 3. SqueezeEmbedding để loại bỏ padding
+
+        # 3. SqueezeEmbedding
         self.squeeze_embedding = SqueezeEmbedding()
-        
-        # 4. Point-wise Feed Forward Network
+
+        # 4. FFN
         self.point_wise_ffn = PointWiseFeedForward(
-            d_model=bert_hidden_size + kg_hidden_size,  # Cập nhật input size
+            d_model=bert_hidden_size + kg_hidden_size,
             d_ff=lstm_hidden_size * 4,
             dropout=dropout
         )
-        
-        # 5. BiLSTM
+
+        # 5. BiLSTM (256 = 128 mỗi chiều)
         self.bilstm = DynamicRNN(
-            input_size=lstm_hidden_size,
-            hidden_size=lstm_hidden_size,
+            input_size=bert_hidden_size + kg_hidden_size,
+            hidden_size=256,
             num_layers=2,
             batch_first=True,
             bidirectional=True,
             dropout=dropout
         )
-        
-        # Dropout
+
+        # Dropout + Classifier + CRF
         self.dropout = nn.Dropout(dropout)
+        # Classifier output size should match number of labels (including START/END)
+        self.classifier = nn.Linear(lstm_hidden_size * 2, num_labels + 2)  # *2 for bidirectional
+        # Initialize CRF with proper number of tags
+        self.crf = CRF(num_labels + 2)  # TorchCRF doesn't support batch_first parameter
         
-        # 6. CRF layer
-        self.crf = CRF(num_labels + 2)  # +2 cho START và END
-        
-        # Classifier
-        self.classifier = nn.Linear(lstm_hidden_size * 2, num_labels + 2)  # *2 cho bidirectional
-        
-        # Khởi tạo trọng số
+        # Initialize CRF transitions with small values
+        with torch.no_grad():
+            self.crf.transitions.data *= 0.1
+            # Make transitions to START and END tags more likely
+            self.crf.transitions.data[:, self.start_tag_id] *= 0.1
+            self.crf.transitions.data[self.end_tag_id, :] *= 0.1
+
         self._init_weights()
-        
         logger.info("Khởi tạo mô hình thành công")
-    
+
     def _init_weights(self):
-        """Khởi tạo trọng số cho các layer."""
-        # Khởi tạo trọng số cho BERT (nếu cần)
         for name, param in self.bert.named_parameters():
-            if 'layer.11' in name or 'layer.10' in name:  # Chỉ khởi tạo lại cho 2 layer cuối
+            if 'layer.11' in name or 'layer.10' in name:
                 if param.dim() > 1:
                     nn.init.xavier_uniform_(param)
                 elif 'bias' in name:
                     nn.init.zeros_(param)
-        
-        # Khởi tạo trọng số cho BiLSTM
         for name, param in self.bilstm.named_parameters():
             if param.dim() > 1:
                 nn.init.orthogonal_(param)
             elif 'bias' in name:
                 nn.init.zeros_(param)
-        
-        # Khởi tạo trọng số cho classifier
         nn.init.xavier_uniform_(self.classifier.weight)
         nn.init.zeros_(self.classifier.bias)
-    
+
     def forward(self, input_embeds, attention_mask, labels=None):
         """Forward pass của mô hình.
         
@@ -162,235 +160,72 @@ class PhoBERT_CRF_KGAN(nn.Module):
                 - Nếu training: loss tensor
                 - Nếu inference: danh sách các nhãn dự đoán
         """
-        # Log shapes
         logger.debug(f"Input embeddings shape: {input_embeds.shape}")
         logger.debug(f"Attention mask shape: {attention_mask.shape}")
-        
-        # Chuẩn hóa attention mask
+
+        # 1. Chuẩn hóa attention mask
         normalized_mask = attention_mask.bool()
-        
-        # Sử dụng BERT embeddings cho cả BERT và KG
+
+        # 2. Tạo KG embeddings và tính attention
         bert_embeds = input_embeds
-        # Tạo KG embeddings từ BERT embeddings bằng một linear projection
-        kg_embeds = self.kg_projection(bert_embeds) if hasattr(self, 'kg_projection') else bert_embeds
-        
-        # Áp dụng KG attention với mask đã chuẩn hóa
+        kg_embeds = self.kg_projection(bert_embeds)
         kg_attended = self.kg_attention(kg_embeds, normalized_mask)
-        
-        # Kết hợp BERT và KG embeddings
+
+        # 3. Kết hợp và squeeze
         combined_embeds = torch.cat([bert_embeds, kg_attended], dim=-1)
-        
-        # Áp dụng SqueezeEmbedding với mask đã chuẩn hóa
         squeezed_embeds = self.squeeze_embedding(combined_embeds, normalized_mask)
-        
-        # Point-wise Feed Forward
+
+        # 4. FFN + BiLSTM + Dropout + Linear
         ffn_output = self.point_wise_ffn(squeezed_embeds)
-        
-        # BiLSTM với mask đã chuẩn hóa
         lstm_output, _ = self.bilstm(ffn_output, normalized_mask)
-        
-        # Dropout
         lstm_output = self.dropout(lstm_output)
-        
-        # Classifier
         emissions = self.classifier(lstm_output)
-        
-        # Chuyển đổi tensor để phù hợp với CRF (seq_len, batch_size, num_tags)
-        emissions = emissions.transpose(0, 1)
-        
+
+        # Debug log emissions
+        logger.debug(f"Emissions shape: {emissions.shape}")
+        logger.debug(f"Emissions min/max/mean: {emissions.min().item():.4f}/{emissions.max().item():.4f}/{emissions.mean().item():.4f}")
+
+        # 5. Tính loss hoặc decode
         if labels is not None:
-            # Thêm START và END tags cho labels
             labels = labels.clone()
             labels[labels == self.pad_tag_id] = self.end_tag_id
-            labels = torch.cat([
-                torch.full((labels.size(0), 1), self.start_tag_id, device=labels.device),
-                labels
-            ], dim=1)
             
-            # Chuyển đổi labels và mask
-            labels = labels.transpose(0, 1)
-            mask = normalized_mask.transpose(0, 1)
+            # Debug log labels
+            logger.debug(f"Labels shape: {labels.shape}")
+            logger.debug(f"Unique labels: {torch.unique(labels).tolist()}")
             
-            # Training mode: tính loss với mask đã chuẩn hóa
-            loss = self.crf.neg_log_likelihood(emissions, labels, mask=mask)
-            logger.debug(f"Training loss: {loss.item():.4f}")
+            # CRF expects (seq_len, batch_size, num_tags) for emissions
+            # and (seq_len, batch_size) for labels
+            emissions = emissions.transpose(0, 1)  # (batch, seq, tags) -> (seq, batch, tags)
+            labels = labels.transpose(0, 1)  # (batch, seq) -> (seq, batch)
+            mask = normalized_mask.transpose(0, 1)  # (batch, seq) -> (seq, batch)
+            
+            # CRF returns negative log likelihood
+            loss = self.crf(emissions, labels, mask=mask)
+            # Take mean of loss across batch
+            loss = loss.mean()
+            logger.debug(f"Raw CRF loss: {loss.item():.4f}")
             return loss
         else:
-            # Inference mode: decode labels với mask đã chuẩn hóa
-            mask = normalized_mask.transpose(0, 1)
-            predictions = self.crf.decode(emissions, mask=mask)
+            # CRF expects (seq_len, batch_size, num_tags) for emissions
+            emissions = emissions.transpose(0, 1)  # (batch, seq, tags) -> (seq, batch, tags)
+            mask = normalized_mask.transpose(0, 1)  # (batch, seq) -> (seq, batch)
             
-            # Chuyển đổi lại predictions về dạng batch_first
-            predictions = [pred for pred in zip(*predictions)]
-            
-            # Loại bỏ START và END tags
-            predictions = [pred[1:-1] for pred in predictions]
-            
-            # Cắt predictions theo độ dài thực tế của mỗi câu
+            # Use viterbi_decode for predictions
+            predictions = self.crf.viterbi_decode(emissions, mask=mask)
+            # Convert predictions back to batch-first format
+            predictions = [pred for pred in zip(*predictions)]  # Transpose back to (batch, seq)
             seq_lengths = normalized_mask.sum(dim=1).tolist()
             predictions = [pred[:length] for pred, length in zip(predictions, seq_lengths)]
             
-            logger.debug(f"Decoded {len(predictions)} sequences")
+            # Debug log predictions
+            logger.debug(f"Number of sequences decoded: {len(predictions)}")
+            if predictions:
+                logger.debug(f"Sample prediction lengths: {[len(p) for p in predictions[:5]]}")
+                logger.debug(f"Sample predictions: {predictions[:5]}")
+            
             return predictions
-    
-    def train_epoch(self, dataloader, optimizer, scheduler=None):
-        """Huấn luyện một epoch.
-        
-        Args:
-            dataloader: DataLoader chứa dữ liệu training
-            optimizer: Optimizer
-            scheduler: Learning rate scheduler (optional)
-            
-        Returns:
-            tuple: (loss trung bình, metrics)
-                - loss: float
-                - metrics: dict chứa precision, recall, f1 cho từng class
-        """
-        self.train()
-        total_loss = 0
-        all_predictions = []
-        all_labels = []
-        
-        for batch_idx, (input_embeds, attention_mask, labels) in enumerate(dataloader):
-            # Chuyển dữ liệu lên device
-            input_embeds = input_embeds.to(self.device)
-            attention_mask = attention_mask.to(self.device)
-            labels = labels.to(self.device)
-            
-            # Forward pass
-            loss = self(input_embeds, attention_mask, labels)
-            
-            # Backward pass
-            optimizer.zero_grad()
-            loss.backward()
-            
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(self.parameters(), self.max_grad_norm)
-            
-            # Update weights
-            optimizer.step()
-            if scheduler is not None:
-                scheduler.step()
-            
-            # Cập nhật loss
-            total_loss += loss.item()
-            
-            # Lưu predictions và labels cho metrics
-            with torch.no_grad():
-                predictions = self(input_embeds, attention_mask)
-                normalized_mask = attention_mask.bool()
-                for pred, label, m in zip(predictions, labels, normalized_mask):
-                    valid_pred = [p for p, mask_val in zip(pred, m) if mask_val]
-                    valid_label = [l.item() for l, mask_val in zip(label, m) if mask_val]
-                    all_predictions.extend(valid_pred)
-                    all_labels.extend(valid_label)
-            
-            # Log progress
-            if (batch_idx + 1) % 10 == 0:
-                # Tính metrics cho batch hiện tại
-                batch_precision, batch_recall, batch_f1, _ = precision_recall_fscore_support(
-                    all_labels[-len(valid_label):],
-                    all_predictions[-len(valid_pred):],
-                    average='weighted'
-                )
-                logger.info(
-                    f"Batch {batch_idx + 1}/{len(dataloader)}, "
-                    f"Loss: {loss.item():.4f}, "
-                    f"F1: {batch_f1:.4f}, "
-                    f"Precision: {batch_precision:.4f}, "
-                    f"Recall: {batch_recall:.4f}"
-                )
-        
-        # Tính metrics cho toàn bộ epoch
-        precision, recall, f1, _ = precision_recall_fscore_support(
-            all_labels,
-            all_predictions,
-            average=None,
-            labels=range(self.num_labels)
-        )
-        
-        # Tính metrics trung bình (weighted)
-        avg_precision, avg_recall, avg_f1, _ = precision_recall_fscore_support(
-            all_labels,
-            all_predictions,
-            average='weighted'
-        )
-        
-        metrics = {
-            'precision': precision.tolist(),
-            'recall': recall.tolist(),
-            'f1': f1.tolist(),
-            'avg_precision': avg_precision,
-            'avg_recall': avg_recall,
-            'avg_f1': avg_f1
-        }
-        
-        return total_loss / len(dataloader), metrics
-    
-    def evaluate(self, dataloader):
-        """Đánh giá mô hình.
-        
-        Args:
-            dataloader: DataLoader chứa dữ liệu validation/test
-            
-        Returns:
-            tuple: (loss trung bình, metrics)
-                - loss: float
-                - metrics: dict chứa precision, recall, f1 cho từng class
-        """
-        self.eval()
-        total_loss = 0
-        all_predictions = []
-        all_labels = []
-        
-        with torch.no_grad():
-            for input_embeds, attention_mask, labels in dataloader:
-                # Chuyển dữ liệu lên device
-                input_embeds = input_embeds.to(self.device)
-                attention_mask = attention_mask.to(self.device)
-                labels = labels.to(self.device)
-                
-                # Forward pass
-                loss = self(input_embeds, attention_mask, labels)
-                predictions = self(input_embeds, attention_mask)
-                
-                # Cập nhật loss
-                total_loss += loss.item()
-                
-                # Lưu predictions và labels với mask đã chuẩn hóa
-                normalized_mask = attention_mask.bool()
-                for pred, label, m in zip(predictions, labels, normalized_mask):
-                    valid_pred = [p for p, mask_val in zip(pred, m) if mask_val]
-                    valid_label = [l.item() for l, mask_val in zip(label, m) if mask_val]
-                    all_predictions.extend(valid_pred)
-                    all_labels.extend(valid_label)
-        
-        # Tính metrics
-        precision, recall, f1, _ = precision_recall_fscore_support(
-            all_labels,
-            all_predictions,
-            average=None,
-            labels=range(self.num_labels)
-        )
-        
-        # Tính metrics trung bình (weighted)
-        avg_precision, avg_recall, avg_f1, _ = precision_recall_fscore_support(
-            all_labels,
-            all_predictions,
-            average='weighted'
-        )
-        
-        metrics = {
-            'precision': precision.tolist(),
-            'recall': recall.tolist(),
-            'f1': f1.tolist(),
-            'avg_precision': avg_precision,
-            'avg_recall': avg_recall,
-            'avg_f1': avg_f1
-        }
-        
-        return total_loss / len(dataloader), metrics
-    
+
     def fit(
         self,
         train_dataloader,
@@ -508,56 +343,187 @@ class PhoBERT_CRF_KGAN(nn.Module):
             self.load_state_dict(best_model_state)
         
         return history
-    
-    def save_pretrained(self, path):
-        """Lưu mô hình.
+
+    def train_epoch(self, dataloader, optimizer, scheduler=None):
+        """Huấn luyện một epoch.
         
         Args:
-            path (str): Đường dẫn để lưu mô hình
-        """
-        torch.save({
-            'model_state_dict': self.state_dict(),
-            'bert_hidden_size': self.bert_hidden_size,
-            'kg_hidden_size': self.kg_hidden_size,
-            'lstm_hidden_size': self.lstm_hidden_size,
-            'num_labels': self.num_labels,
-            'start_tag_id': self.start_tag_id,
-            'end_tag_id': self.end_tag_id,
-            'pad_tag_id': self.pad_tag_id,
-            'max_grad_norm': self.max_grad_norm,
-            'warmup_steps': self.warmup_steps,
-            'early_stopping_patience': self.early_stopping_patience
-        }, path)
-        logger.info(f"Đã lưu mô hình tại {path}")
-    
-    @classmethod
-    def from_pretrained(cls, path, device=None):
-        """Load mô hình đã lưu.
-        
-        Args:
-            path (str): Đường dẫn đến file mô hình đã lưu
-            device (torch.device, optional): Thiết bị tính toán
+            dataloader: DataLoader chứa dữ liệu training
+            optimizer: Optimizer
+            scheduler: Learning rate scheduler (optional)
             
         Returns:
-            PhoBERT_CRF_KGAN: Mô hình đã được load
+            tuple: (loss trung bình, metrics)
+                - loss: float
+                - metrics: dict chứa precision, recall, f1 cho từng class
         """
-        checkpoint = torch.load(path, map_location=device)
+        self.train()
+        total_loss = 0
+        all_predictions = []
+        all_labels = []
         
-        model = cls(
-            bert_hidden_size=checkpoint['bert_hidden_size'],
-            kg_hidden_size=checkpoint['kg_hidden_size'],
-            lstm_hidden_size=checkpoint['lstm_hidden_size'],
-            num_labels=checkpoint['num_labels'],
-            start_tag_id=checkpoint['start_tag_id'],
-            end_tag_id=checkpoint['end_tag_id'],
-            pad_tag_id=checkpoint['pad_tag_id'],
-            max_grad_norm=checkpoint.get('max_grad_norm', 1.0),
-            warmup_steps=checkpoint.get('warmup_steps', 0),
-            early_stopping_patience=checkpoint.get('early_stopping_patience', 3),
-            device=device
+        for batch_idx, (input_embeds, attention_mask, labels) in enumerate(dataloader):
+            # Debug log input shapes
+            if batch_idx == 0:
+                logger.debug(f"Batch input shapes - embeds: {input_embeds.shape}, mask: {attention_mask.shape}, labels: {labels.shape}")
+                logger.debug(f"Unique labels in first batch: {torch.unique(labels).tolist()}")
+            
+            # Chuyển dữ liệu lên device
+            input_embeds = input_embeds.to(self.device)
+            attention_mask = attention_mask.to(self.device)
+            labels = labels.to(self.device)
+            
+            # Forward pass
+            loss = self(input_embeds, attention_mask, labels)
+            
+            # Debug log loss
+            if batch_idx == 0:
+                logger.debug(f"First batch loss: {loss.item():.4f}")
+            
+            # Backward pass
+            optimizer.zero_grad()
+            loss.backward()
+            
+            # Debug log gradients
+            if batch_idx == 0:
+                for name, param in self.named_parameters():
+                    if param.grad is not None:
+                        logger.debug(f"Gradients for {name} - mean: {param.grad.mean().item():.4f}, std: {param.grad.std().item():.4f}")
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(self.parameters(), self.max_grad_norm)
+            
+            # Update weights
+            optimizer.step()
+            if scheduler is not None and not isinstance(scheduler, ReduceLROnPlateau):
+                scheduler.step()
+            
+            # Cập nhật loss
+            total_loss += loss.item()
+            
+            # Lưu predictions và labels cho metrics
+            with torch.no_grad():
+                predictions = self(input_embeds, attention_mask)
+                normalized_mask = attention_mask.bool()
+                for pred, label, m in zip(predictions, labels, normalized_mask):
+                    valid_pred = [p for p, mask_val in zip(pred, m) if mask_val]
+                    valid_label = [l.item() for l, mask_val in zip(label, m) if mask_val]
+                    all_predictions.extend(valid_pred)
+                    all_labels.extend(valid_label)
+                
+                # Debug logging for predictions
+                if batch_idx % 10 == 0:
+                    logger.debug(f"Batch {batch_idx} - Sample predictions: {valid_pred[:5]}")
+                    logger.debug(f"Batch {batch_idx} - Sample labels: {valid_label[:5]}")
+                    logger.debug(f"Batch {batch_idx} - Unique predictions: {set(valid_pred)}")
+                    logger.debug(f"Batch {batch_idx} - Unique labels: {set(valid_label)}")
+                    logger.debug(f"Batch {batch_idx} - Prediction distribution: {torch.bincount(torch.tensor(valid_pred)).tolist()}")
+            
+            # Log progress
+            if (batch_idx + 1) % 10 == 0:
+                # Tính metrics cho batch hiện tại với zero_division=0
+                batch_precision, batch_recall, batch_f1, _ = precision_recall_fscore_support(
+                    all_labels[-len(valid_label):],
+                    all_predictions[-len(valid_pred):],
+                    average='weighted',
+                    zero_division=0
+                )
+                logger.info(
+                    f"Batch {batch_idx + 1}/{len(dataloader)}, "
+                    f"Loss: {loss.item():.4f}, "
+                    f"F1: {batch_f1:.4f}, "
+                    f"Precision: {batch_precision:.4f}, "
+                    f"Recall: {batch_recall:.4f}"
+                )
+        
+        # Tính metrics cho toàn bộ epoch với zero_division=0
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            all_labels,
+            all_predictions,
+            average=None,
+            labels=range(self.num_labels),
+            zero_division=0
         )
         
-        model.load_state_dict(checkpoint['model_state_dict'])
-        logger.info(f"Đã load mô hình từ {path}")
+        # Tính metrics trung bình (weighted) với zero_division=0
+        avg_precision, avg_recall, avg_f1, _ = precision_recall_fscore_support(
+            all_labels,
+            all_predictions,
+            average='weighted',
+            zero_division=0
+        )
         
-        return model
+        metrics = {
+            'precision': precision.tolist(),
+            'recall': recall.tolist(),
+            'f1': f1.tolist(),
+            'avg_precision': avg_precision,
+            'avg_recall': avg_recall,
+            'avg_f1': avg_f1
+        }
+        
+        return total_loss / len(dataloader), metrics
+
+    def evaluate(self, dataloader):
+        """Đánh giá mô hình.
+        
+        Args:
+            dataloader: DataLoader chứa dữ liệu validation/test
+            
+        Returns:
+            tuple: (loss trung bình, metrics)
+                - loss: float
+                - metrics: dict chứa precision, recall, f1 cho từng class
+        """
+        self.eval()
+        total_loss = 0
+        all_predictions = []
+        all_labels = []
+        
+        with torch.no_grad():
+            for input_embeds, attention_mask, labels in dataloader:
+                # Chuyển dữ liệu lên device
+                input_embeds = input_embeds.to(self.device)
+                attention_mask = attention_mask.to(self.device)
+                labels = labels.to(self.device)
+                
+                # Forward pass
+                loss = self(input_embeds, attention_mask, labels)
+                predictions = self(input_embeds, attention_mask)
+                
+                # Cập nhật loss
+                total_loss += loss.item()
+                
+                # Lưu predictions và labels với mask đã chuẩn hóa
+                normalized_mask = attention_mask.bool()
+                for pred, label, m in zip(predictions, labels, normalized_mask):
+                    valid_pred = [p for p, mask_val in zip(pred, m) if mask_val]
+                    valid_label = [l.item() for l, mask_val in zip(label, m) if mask_val]
+                    all_predictions.extend(valid_pred)
+                    all_labels.extend(valid_label)
+        
+        # Tính metrics
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            all_labels,
+            all_predictions,
+            average=None,
+            labels=range(self.num_labels)
+        )
+        
+        # Tính metrics trung bình (weighted)
+        avg_precision, avg_recall, avg_f1, _ = precision_recall_fscore_support(
+            all_labels,
+            all_predictions,
+            average='weighted'
+        )
+        
+        metrics = {
+            'precision': precision.tolist(),
+            'recall': recall.tolist(),
+            'f1': f1.tolist(),
+            'avg_precision': avg_precision,
+            'avg_recall': avg_recall,
+            'avg_f1': avg_f1
+        }
+        
+        return total_loss / len(dataloader), metrics

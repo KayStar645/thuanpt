@@ -11,3 +11,4 @@ pyvi>=0.1.1
 emoji>=2.2.0
 langdetect>=1.0.9
 torchcrf==1.1.0
+typing-extensions emoji

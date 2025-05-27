@@ -58,7 +58,7 @@ pip install -r requirements.txt
 ### Huấn luyện mô hình
 
 ```bash
-python src/main.py --mode train --epochs 2 --batch_size 4 --learning_rate 1e-5
+python src/main.py --mode train --epochs 2 --batch_size 6 --learning_rate 1e-5
 ```
 
 ### Dự đoán
