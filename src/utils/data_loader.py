@@ -6,7 +6,7 @@ import json
 import logging
 import torch
 from torch.utils.data import Dataset
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoModel
 
 # Thiết lập logging
 logging.basicConfig(level=logging.INFO)
@@ -19,12 +19,17 @@ class ABSADataset(Dataset):
         data_dir (str): Đường dẫn đến thư mục chứa dữ liệu
         tokenizer: Tokenizer để tokenize text
         max_length (int): Độ dài tối đa của sequence
+        bert_model_name (str): Tên mô hình BERT để tạo embeddings
     """
     
-    def __init__(self, data_dir, tokenizer, max_length=128):
+    def __init__(self, data_dir, tokenizer, max_length=128, bert_model_name="vinai/phobert-base"):
         self.data_dir = data_dir
         self.tokenizer = tokenizer
         self.max_length = max_length
+        
+        # Load BERT model để tạo embeddings
+        self.bert_model = AutoModel.from_pretrained(bert_model_name)
+        self.bert_model.eval()  # Chuyển sang chế độ evaluation
         
         # Label mapping cho sentiment
         self.sentiment_map = {
@@ -91,7 +96,7 @@ class ABSADataset(Dataset):
         
         Returns:
             tuple: (input_embeds, attention_mask, labels)
-                - input_embeds: Tensor chứa embeddings [seq_len, hidden_size]
+                - input_embeds: Tensor chứa BERT embeddings [seq_len, hidden_size]
                 - attention_mask: Tensor mask [seq_len]
                 - labels: Tensor nhãn [seq_len]
         """
@@ -110,6 +115,15 @@ class ABSADataset(Dataset):
         input_ids = encoding['input_ids'].squeeze(0)  # [seq_len]
         attention_mask = encoding['attention_mask'].squeeze(0)  # [seq_len]
         
+        # Tạo BERT embeddings
+        with torch.no_grad():
+            outputs = self.bert_model(
+                input_ids=input_ids.unsqueeze(0),  # Thêm batch dimension
+                attention_mask=attention_mask.unsqueeze(0)
+            )
+            # Lấy embeddings từ layer cuối cùng
+            input_embeds = outputs.last_hidden_state.squeeze(0)  # [seq_len, hidden_size]
+        
         # Chuyển đổi labels thành tensor
         labels = torch.tensor(item['labels'], dtype=torch.long)
         
@@ -121,13 +135,5 @@ class ABSADataset(Dataset):
         else:
             # Cắt labels nếu dài hơn max_length
             labels = labels[:self.max_length]
-        
-        # Tạo input embeddings từ input_ids
-        with torch.no_grad():
-            input_embeds = self.tokenizer.convert_ids_to_tokens(input_ids)
-            input_embeds = torch.tensor(
-                [self.tokenizer.convert_tokens_to_ids(t) for t in input_embeds],
-                dtype=torch.long
-            )
         
         return input_embeds, attention_mask, labels 
