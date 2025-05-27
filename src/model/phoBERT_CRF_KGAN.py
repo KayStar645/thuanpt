@@ -7,11 +7,11 @@ import logging
 import torch
 import torch.nn as nn
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from transformers import AutoModel, get_linear_schedule_with_warmup
-from .crf import CRF
+from transformers import AutoModel, get_linear_schedule_with_warmup, AutoTokenizer
+from TorchCRF import CRF
 from .attention import KGAttention
+from .feedforward import PointWiseFeedForward
 from .squeeze_embedding import SqueezeEmbedding
-from .point_wise_feed_forward import PointWiseFeedForward
 from .dynamic_rnn import DynamicRNN
 
 # Thiết lập logging
@@ -78,10 +78,9 @@ class PhoBERT_CRF_KGAN(nn.Module):
         self.warmup_steps = warmup_steps
         self.early_stopping_patience = early_stopping_patience
         
-        # 1. PhoBERT (fine-tune 4 layer cuối)
+        # Load BERT
         self.bert = AutoModel.from_pretrained(bert_model_name)
-        for param in list(self.bert.parameters())[:-4]:  # Freeze tất cả trừ 4 layer cuối
-            param.requires_grad = False
+        self.tokenizer = AutoTokenizer.from_pretrained(bert_model_name)
         
         # 2. Knowledge Graph Attention Network
         self.kg_attention = KGAttention(
@@ -96,8 +95,8 @@ class PhoBERT_CRF_KGAN(nn.Module):
         
         # 4. Point-wise Feed Forward Network
         self.point_wise_ffn = PointWiseFeedForward(
-            input_size=bert_hidden_size + kg_hidden_size,
-            hidden_size=lstm_hidden_size,
+            d_model=bert_hidden_size,
+            d_ff=lstm_hidden_size * 4,
             dropout=dropout
         )
         
@@ -116,7 +115,7 @@ class PhoBERT_CRF_KGAN(nn.Module):
         
         # 6. CRF layer
         self.crf = CRF(
-            num_tags=num_labels + 2,  # +2 cho START và END
+            num_labels + 2,  # +2 cho START và END
             start_tag=start_tag_id,
             end_tag=end_tag_id,
             pad_tag=pad_tag_id
@@ -220,14 +219,23 @@ class PhoBERT_CRF_KGAN(nn.Module):
         # Classifier
         emissions = self.classifier(lstm_output)
         
+        # Chuyển đổi tensor để phù hợp với CRF (seq_len, batch_size, num_tags)
+        emissions = emissions.transpose(0, 1)
         if labels is not None:
+            labels = labels.transpose(0, 1)
+            mask = normalized_mask.transpose(0, 1)
+            
             # Training mode: tính loss với mask đã chuẩn hóa
-            loss = self.crf.neg_log_likelihood(emissions, labels, mask=normalized_mask)
+            loss = self.crf.neg_log_likelihood(emissions, labels, mask=mask)
             logger.debug(f"Training loss: {loss.item():.4f}")
             return loss
         else:
             # Inference mode: decode labels với mask đã chuẩn hóa
-            predictions = self.crf.decode(emissions, mask=normalized_mask)
+            mask = normalized_mask.transpose(0, 1)
+            predictions = self.crf.decode(emissions, mask=mask)
+            
+            # Chuyển đổi lại predictions về dạng batch_first
+            predictions = [pred for pred in zip(*predictions)]
             
             # Cắt predictions theo độ dài thực tế của mỗi câu
             seq_lengths = normalized_mask.sum(dim=1).tolist()

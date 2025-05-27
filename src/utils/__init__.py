@@ -1,13 +1,9 @@
 """
-Gói chứa các tiện ích và công cụ xử lý dữ liệu.
-Bao gồm:
-- Xử lý văn bản tiếng Việt
-- Công cụ xử lý chuỗi
-- Chuyển đổi dữ liệu sang định dạng JSONL cho ABSA
+Module utils cho mô hình ABSA.
 """
 
-from .vietnamese_processor import VietnameseProcessor
-from .seq_utils import sequence_utils
-from .convert_to_absa_jsonl import convert_to_absa_jsonl
+from .preprocess import preprocess_text
+from .data_loader import ABSADataset
+from .vietnamese_processor import VietnameseTextPreprocessor as VietnameseProcessor
 
-__all__ = ['VietnameseProcessor', 'sequence_utils', 'convert_to_absa_jsonl'] 
+__all__ = ['preprocess_text', 'ABSADataset', 'VietnameseProcessor'] 

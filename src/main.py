@@ -4,9 +4,15 @@ Cho phép người dùng chọn giữa chế độ training và prediction.
 """
 
 import os
+import sys
 import argparse
-from train import main as train_main
-from predict import main as predict_main
+import logging
+
+# Thêm thư mục gốc vào PYTHONPATH
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from src.train import main as train_main
+from src.predict import main as predict_main
 
 def parse_args():
     """Parse command line arguments."""

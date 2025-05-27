@@ -13,6 +13,7 @@ import pandas as pd
 import glob
 from pathlib import Path
 import unicodedata
+from underthesea import word_tokenize
 
 
 # https://ihateregex.io
