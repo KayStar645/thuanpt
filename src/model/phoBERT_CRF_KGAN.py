@@ -83,12 +83,15 @@ class PhoBERT_CRF_KGAN(nn.Module):
         self.bert = AutoModel.from_pretrained(bert_model_name)
         self.tokenizer = AutoTokenizer.from_pretrained(bert_model_name)
         
+        # Projection layer để chuyển đổi BERT embeddings sang KG embeddings
+        self.kg_projection = nn.Linear(bert_hidden_size, kg_hidden_size)
+        
         # 2. Knowledge Graph Attention Network
         self.kg_attention = KGAttention(
             input_size=kg_hidden_size,
             hidden_size=kg_hidden_size,
             dropout=dropout,
-            attention_dropout=dropout  # Thêm attention dropout
+            attention_dropout=dropout
         )
         
         # 3. SqueezeEmbedding để loại bỏ padding
@@ -96,7 +99,7 @@ class PhoBERT_CRF_KGAN(nn.Module):
         
         # 4. Point-wise Feed Forward Network
         self.point_wise_ffn = PointWiseFeedForward(
-            d_model=bert_hidden_size,
+            d_model=bert_hidden_size + kg_hidden_size,  # Cập nhật input size
             d_ff=lstm_hidden_size * 4,
             dropout=dropout
         )
@@ -116,9 +119,6 @@ class PhoBERT_CRF_KGAN(nn.Module):
         
         # 6. CRF layer
         self.crf = CRF(num_labels + 2)  # +2 cho START và END
-        self.start_tag_id = start_tag_id
-        self.end_tag_id = end_tag_id
-        self.pad_tag_id = pad_tag_id
         
         # Classifier
         self.classifier = nn.Linear(lstm_hidden_size * 2, num_labels + 2)  # *2 cho bidirectional
@@ -149,41 +149,11 @@ class PhoBERT_CRF_KGAN(nn.Module):
         nn.init.xavier_uniform_(self.classifier.weight)
         nn.init.zeros_(self.classifier.bias)
     
-    def build_input_embeds(self, bert_embeds, kg_embeds, attention_mask):
-        """Xây dựng input embeddings từ BERT và KG.
-        
-        Args:
-            bert_embeds (torch.Tensor): BERT embeddings [batch_size, seq_len, bert_hidden_size]
-            kg_embeds (torch.Tensor): KG embeddings [batch_size, seq_len, kg_hidden_size]
-            attention_mask (torch.Tensor): Attention mask [batch_size, seq_len]
-            
-        Returns:
-            tuple: (combined_embeds, normalized_mask)
-                - combined_embeds: Tensor kết hợp [batch_size, seq_len, bert_hidden_size + kg_hidden_size]
-                - normalized_mask: Boolean mask đã chuẩn hóa [batch_size, seq_len]
-        """
-        # Log shapes
-        logger.debug(f"BERT embeddings shape: {bert_embeds.shape}")
-        logger.debug(f"KG embeddings shape: {kg_embeds.shape}")
-        logger.debug(f"Attention mask shape: {attention_mask.shape}")
-        
-        # Chuẩn hóa attention mask
-        normalized_mask = attention_mask.bool()
-        
-        # Áp dụng KG attention với mask đã chuẩn hóa
-        kg_attended = self.kg_attention(kg_embeds, normalized_mask)
-        
-        # Kết hợp BERT và KG embeddings
-        combined_embeds = torch.cat([bert_embeds, kg_attended], dim=-1)
-        logger.debug(f"Combined embeddings shape: {combined_embeds.shape}")
-        
-        return combined_embeds, normalized_mask
-    
     def forward(self, input_embeds, attention_mask, labels=None):
         """Forward pass của mô hình.
         
         Args:
-            input_embeds (torch.Tensor): Combined embeddings [batch_size, seq_len, bert_hidden_size + kg_hidden_size]
+            input_embeds (torch.Tensor): BERT embeddings [batch_size, seq_len, bert_hidden_size]
             attention_mask (torch.Tensor): Attention mask [batch_size, seq_len]
             labels (torch.Tensor, optional): Ground truth labels [batch_size, seq_len]
             
@@ -196,12 +166,19 @@ class PhoBERT_CRF_KGAN(nn.Module):
         logger.debug(f"Input embeddings shape: {input_embeds.shape}")
         logger.debug(f"Attention mask shape: {attention_mask.shape}")
         
-        # Tách BERT và KG embeddings
-        bert_embeds = input_embeds[:, :, :self.bert_hidden_size]
-        kg_embeds = input_embeds[:, :, self.bert_hidden_size:]
+        # Chuẩn hóa attention mask
+        normalized_mask = attention_mask.bool()
         
-        # Xây dựng input embeddings và chuẩn hóa mask
-        combined_embeds, normalized_mask = self.build_input_embeds(bert_embeds, kg_embeds, attention_mask)
+        # Sử dụng BERT embeddings cho cả BERT và KG
+        bert_embeds = input_embeds
+        # Tạo KG embeddings từ BERT embeddings bằng một linear projection
+        kg_embeds = self.kg_projection(bert_embeds) if hasattr(self, 'kg_projection') else bert_embeds
+        
+        # Áp dụng KG attention với mask đã chuẩn hóa
+        kg_attended = self.kg_attention(kg_embeds, normalized_mask)
+        
+        # Kết hợp BERT và KG embeddings
+        combined_embeds = torch.cat([bert_embeds, kg_attended], dim=-1)
         
         # Áp dụng SqueezeEmbedding với mask đã chuẩn hóa
         squeezed_embeds = self.squeeze_embedding(combined_embeds, normalized_mask)
