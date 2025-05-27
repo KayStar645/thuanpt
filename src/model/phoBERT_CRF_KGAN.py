@@ -1,196 +1,480 @@
+"""
+Module chứa mô hình PhoBERT-CRF-KGAN cho bài toán ABSA.
+Kết hợp PhoBERT, Knowledge Graph Attention Network và CRF để phân tích cảm xúc dựa trên khía cạnh.
+"""
+
+import logging
 import torch
 import torch.nn as nn
-from transformers import AutoModel
-from model.crf import CRF
-from model.dynamic_rnn import DynamicLSTM
-from model.point_wise_feed_forward import PointWiseFeedForward
-from model.squeeze_embedding import SqueezeEmbedding
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+from transformers import AutoModel, get_linear_schedule_with_warmup
+from .crf import CRF
+from .attention import KGAttention
+from .squeeze_embedding import SqueezeEmbedding
+from .point_wise_feed_forward import PointWiseFeedForward
+from .dynamic_rnn import DynamicRNN
+
+# Thiết lập logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class PhoBERT_CRF_KGAN(nn.Module):
-    """Model kết hợp PhoBERT, CRF và Knowledge Graph Attention Network cho bài toán ABSA.
+    """Mô hình PhoBERT-CRF-KGAN cho bài toán ABSA.
+    
+    Kiến trúc:
+    1. PhoBERT (fine-tune 4 layer cuối)
+    2. Knowledge Graph Attention Network
+    3. SqueezeEmbedding để loại bỏ padding
+    4. Point-wise Feed Forward Network
+    5. BiLSTM
+    6. CRF layer
     
     Args:
-        bert_model_name (str): Tên hoặc đường dẫn của model BERT
-        num_labels (int): Số lượng nhãn thực tế (không bao gồm START và END)
-        start_tag_id (int): ID của nhãn bắt đầu
-        end_tag_id (int): ID của nhãn kết thúc
-        pad_tag_id (int): ID của nhãn padding
-        hidden_size (int): Kích thước của vector ẩn
-        kg_dim (int): Kích thước của vector knowledge graph
-        dropout (float): Tỷ lệ dropout
-x        lstm_hidden_size (int): Kích thước của hidden layer trong BiLSTM
-        lstm_num_layers (int): Số lớp trong BiLSTM
-        ff_dim (int): Kích thước của hidden layer trong Point-wise Feed Forward
+        bert_model_name (str): Tên mô hình BERT (mặc định: "vinai/phobert-base")
+        num_labels (int): Số lượng nhãn (không bao gồm START và END)
+        start_tag_id (int): ID của nhãn START
+        end_tag_id (int): ID của nhãn END
+        pad_tag_id (int): ID của nhãn padding (mặc định: -100)
+        bert_hidden_size (int): Kích thước hidden của BERT (mặc định: 768)
+        kg_hidden_size (int): Kích thước hidden của KG (mặc định: 200)
+        lstm_hidden_size (int): Kích thước hidden của LSTM (mặc định: 256)
+        dropout (float): Tỷ lệ dropout (mặc định: 0.1)
+        device (torch.device): Thiết bị tính toán (CPU/GPU)
+        max_grad_norm (float): Giá trị tối đa cho gradient clipping (mặc định: 1.0)
+        warmup_steps (int): Số bước warmup cho learning rate (mặc định: 0)
+        early_stopping_patience (int): Số epoch chờ trước khi early stopping (mặc định: 3)
     """
+    
     def __init__(
         self,
-        bert_model_name: str,
-        num_labels: int,
-        start_tag_id: int,
-        end_tag_id: int,
-        pad_tag_id: int,
-        hidden_size: int = 768,
-        kg_dim: int = 200,
-        dropout: float = 0.1,
-        lstm_hidden_size: int = 256,
-        lstm_num_layers: int = 2,
-        ff_dim: int = 3072
+        bert_model_name="vinai/phobert-base",
+        num_labels=7,
+        start_tag_id=0,
+        end_tag_id=1,
+        pad_tag_id=-100,
+        bert_hidden_size=768,
+        kg_hidden_size=200,
+        lstm_hidden_size=256,
+        dropout=0.1,
+        device=None,
+        max_grad_norm=1.0,
+        warmup_steps=0,
+        early_stopping_patience=3
     ):
-        super(PhoBERT_CRF_KGAN, self).__init__()
+        super().__init__()
         
-        # Load BERT model và đóng băng các layer đầu
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        logger.info(f"Khởi tạo PhoBERT_CRF_KGAN trên {self.device}")
+        
+        # Lưu các tham số
+        self.bert_hidden_size = bert_hidden_size
+        self.kg_hidden_size = kg_hidden_size
+        self.lstm_hidden_size = lstm_hidden_size
+        self.num_labels = num_labels
+        self.start_tag_id = start_tag_id
+        self.end_tag_id = end_tag_id
+        self.pad_tag_id = pad_tag_id
+        self.max_grad_norm = max_grad_norm
+        self.warmup_steps = warmup_steps
+        self.early_stopping_patience = early_stopping_patience
+        
+        # 1. PhoBERT (fine-tune 4 layer cuối)
         self.bert = AutoModel.from_pretrained(bert_model_name)
-        for param in list(self.bert.parameters())[:-4]:  # Chỉ fine-tune 4 layer cuối
+        for param in list(self.bert.parameters())[:-4]:  # Freeze tất cả trừ 4 layer cuối
             param.requires_grad = False
         
-        # Squeeze embedding để xử lý padding hiệu quả
-        self.squeeze_embedding = SqueezeEmbedding(batch_first=True)
+        # 2. Knowledge Graph Attention Network
+        self.kg_attention = KGAttention(
+            input_size=kg_hidden_size,
+            hidden_size=kg_hidden_size,
+            dropout=dropout,
+            attention_dropout=dropout  # Thêm attention dropout
+        )
         
-        # Tổng kích thước vector sau khi kết hợp BERT và KG
-        self.combined_size = hidden_size + kg_dim
+        # 3. SqueezeEmbedding để loại bỏ padding
+        self.squeeze_embedding = SqueezeEmbedding()
         
-        # Layer chuyển đổi với Point-wise Feed Forward
-        self.transform = PointWiseFeedForward(
-            d_model=self.combined_size,
-            d_ff=ff_dim,
+        # 4. Point-wise Feed Forward Network
+        self.point_wise_ffn = PointWiseFeedForward(
+            input_size=bert_hidden_size + kg_hidden_size,
+            hidden_size=lstm_hidden_size,
             dropout=dropout
         )
         
-        # BiLSTM để xử lý chuỗi
-        self.bilstm = DynamicLSTM(
-            input_size=self.combined_size,
-            hidden_size=lstm_hidden_size // 2,  # Chia 2 vì là bidirectional
-            num_layers=lstm_num_layers,
+        # 5. BiLSTM
+        self.bilstm = DynamicRNN(
+            input_size=lstm_hidden_size,
+            hidden_size=lstm_hidden_size,
+            num_layers=2,
             batch_first=True,
             bidirectional=True,
-            dropout=dropout if lstm_num_layers > 1 else 0
+            dropout=dropout
         )
         
-        # Layer phân loại với khởi tạo trọng số
-        self.classifier = nn.Linear(lstm_hidden_size, num_labels + 2)
-        self._init_classifier_weights()
-        
-        # CRF layer với tổng số nhãn
-        self.crf = CRF(
-            tagset_size=num_labels + 2,
-            start_tag_id=start_tag_id,
-            end_tag_id=end_tag_id,
-            pad_tag_id=pad_tag_id
-        )
-        
-        # Knowledge Graph Attention với khởi tạo trọng số
-        self.kg_attention = nn.Sequential(
-            nn.Linear(kg_dim, hidden_size),
-            nn.LayerNorm(hidden_size),  # Thêm LayerNorm
-            nn.Tanh(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size, 1)
-        )
-        self._init_kg_attention_weights()
-        
+        # Dropout
         self.dropout = nn.Dropout(dropout)
         
-        # Khởi tạo trọng số cho toàn bộ model
+        # 6. CRF layer
+        self.crf = CRF(
+            num_tags=num_labels + 2,  # +2 cho START và END
+            start_tag=start_tag_id,
+            end_tag=end_tag_id,
+            pad_tag=pad_tag_id
+        )
+        
+        # Classifier
+        self.classifier = nn.Linear(lstm_hidden_size * 2, num_labels + 2)  # *2 cho bidirectional
+        
+        # Khởi tạo trọng số
         self._init_weights()
-
+        
+        logger.info("Khởi tạo mô hình thành công")
+    
     def _init_weights(self):
-        """Khởi tạo trọng số cho các layer của model."""
+        """Khởi tạo trọng số cho các layer."""
         # Khởi tạo trọng số cho BERT (nếu cần)
         for name, param in self.bert.named_parameters():
             if 'layer.11' in name or 'layer.10' in name:  # Chỉ khởi tạo lại cho 2 layer cuối
-                if param.dim() > 1:  # Chỉ khởi tạo cho tensor 2 chiều trở lên
-                    if 'weight' in name:
-                        nn.init.xavier_uniform_(param)
+                if param.dim() > 1:
+                    nn.init.xavier_uniform_(param)
                 elif 'bias' in name:
                     nn.init.zeros_(param)
         
         # Khởi tạo trọng số cho BiLSTM
         for name, param in self.bilstm.named_parameters():
-            if param.dim() > 1:  # Chỉ khởi tạo cho tensor 2 chiều trở lên
-                if 'weight' in name:
-                    nn.init.orthogonal_(param)
+            if param.dim() > 1:
+                nn.init.orthogonal_(param)
             elif 'bias' in name:
                 nn.init.zeros_(param)
         
-        # Khởi tạo trọng số cho transform layer
-        for name, param in self.transform.named_parameters():
-            if param.dim() > 1:  # Chỉ khởi tạo cho tensor 2 chiều trở lên
-                if 'weight' in name:
-                    nn.init.xavier_uniform_(param)
-            elif 'bias' in name:
-                nn.init.zeros_(param)
-
-    def _init_classifier_weights(self):
-        """Khởi tạo trọng số cho classifier layer."""
-        if self.classifier.weight.dim() > 1:
-            nn.init.xavier_uniform_(self.classifier.weight)
+        # Khởi tạo trọng số cho classifier
+        nn.init.xavier_uniform_(self.classifier.weight)
         nn.init.zeros_(self.classifier.bias)
-
-    def _init_kg_attention_weights(self):
-        """Khởi tạo trọng số cho KG attention layer."""
-        for layer in self.kg_attention:
-            if isinstance(layer, nn.Linear):
-                if layer.weight.dim() > 1:
-                    nn.init.xavier_uniform_(layer.weight)
-                if layer.bias is not None:
-                    nn.init.zeros_(layer.bias)
-
-    def forward(self, input_embeds, attention_mask, labels=None):
-        """Forward pass của model.
+    
+    def build_input_embeds(self, bert_embeds, kg_embeds, attention_mask):
+        """Xây dựng input embeddings từ BERT và KG.
         
         Args:
-            input_embeds (torch.Tensor): Vector đầu vào kết hợp từ BERT và KG
-            attention_mask (torch.Tensor): Mask tensor
-            labels (torch.Tensor, optional): Nhãn đích. Nếu None, model sẽ decode.
+            bert_embeds (torch.Tensor): BERT embeddings [batch_size, seq_len, bert_hidden_size]
+            kg_embeds (torch.Tensor): KG embeddings [batch_size, seq_len, kg_hidden_size]
+            attention_mask (torch.Tensor): Attention mask [batch_size, seq_len]
             
         Returns:
-            Nếu labels được cung cấp: loss (torch.Tensor) - giá trị trung bình qua batch
-            Nếu labels là None: predictions (List[List[int]])
+            tuple: (combined_embeds, normalized_mask)
+                - combined_embeds: Tensor kết hợp [batch_size, seq_len, bert_hidden_size + kg_hidden_size]
+                - normalized_mask: Boolean mask đã chuẩn hóa [batch_size, seq_len]
         """
-        # Tính độ dài thực tế của mỗi chuỗi
-        seq_lengths = attention_mask.sum(dim=1)
+        # Log shapes
+        logger.debug(f"BERT embeddings shape: {bert_embeds.shape}")
+        logger.debug(f"KG embeddings shape: {kg_embeds.shape}")
+        logger.debug(f"Attention mask shape: {attention_mask.shape}")
         
-        # Tách BERT embeddings và KG embeddings
-        bert_embeds = input_embeds[:, :, :768]
-        kg_embeds = input_embeds[:, :, 768:]
+        # Chuẩn hóa attention mask
+        normalized_mask = attention_mask.bool()
         
-        # Áp dụng Knowledge Graph Attention với residual connection
-        kg_attention_weights = self.kg_attention(kg_embeds)
-        kg_attention_weights = torch.softmax(kg_attention_weights, dim=1)
-        kg_attended = kg_embeds * kg_attention_weights + kg_embeds  # Residual connection
+        # Áp dụng KG attention với mask đã chuẩn hóa
+        kg_attended = self.kg_attention(kg_embeds, normalized_mask)
         
         # Kết hợp BERT và KG embeddings
-        combined = torch.cat([bert_embeds, kg_attended], dim=-1)
+        combined_embeds = torch.cat([bert_embeds, kg_attended], dim=-1)
+        logger.debug(f"Combined embeddings shape: {combined_embeds.shape}")
         
-        # Nén embedding để xử lý padding hiệu quả
-        squeezed = self.squeeze_embedding(combined, seq_lengths)
+        return combined_embeds, normalized_mask
+    
+    def forward(self, input_embeds, attention_mask, labels=None):
+        """Forward pass của mô hình.
         
-        # Áp dụng Point-wise Feed Forward với residual connection
-        transformed = self.transform(squeezed) + squeezed
+        Args:
+            input_embeds (torch.Tensor): Combined embeddings [batch_size, seq_len, bert_hidden_size + kg_hidden_size]
+            attention_mask (torch.Tensor): Attention mask [batch_size, seq_len]
+            labels (torch.Tensor, optional): Ground truth labels [batch_size, seq_len]
+            
+        Returns:
+            Union[torch.Tensor, List[List[int]]]: 
+                - Nếu training: loss tensor
+                - Nếu inference: danh sách các nhãn dự đoán
+        """
+        # Log shapes
+        logger.debug(f"Input embeddings shape: {input_embeds.shape}")
+        logger.debug(f"Attention mask shape: {attention_mask.shape}")
         
-        # Áp dụng BiLSTM
-        lstm_out, _ = self.bilstm(transformed, seq_lengths)
+        # Tách BERT và KG embeddings
+        bert_embeds = input_embeds[:, :, :self.bert_hidden_size]
+        kg_embeds = input_embeds[:, :, self.bert_hidden_size:]
         
-        # Dropout và phân loại
-        lstm_out = self.dropout(lstm_out)
-        emissions = self.classifier(lstm_out)
+        # Xây dựng input embeddings và chuẩn hóa mask
+        combined_embeds, normalized_mask = self.build_input_embeds(bert_embeds, kg_embeds, attention_mask)
         
-        # Đảm bảo kích thước khớp nhau
+        # Áp dụng SqueezeEmbedding với mask đã chuẩn hóa
+        squeezed_embeds = self.squeeze_embedding(combined_embeds, normalized_mask)
+        
+        # Point-wise Feed Forward
+        ffn_output = self.point_wise_ffn(squeezed_embeds)
+        
+        # BiLSTM với mask đã chuẩn hóa
+        lstm_output, _ = self.bilstm(ffn_output, normalized_mask)
+        
+        # Dropout
+        lstm_output = self.dropout(lstm_output)
+        
+        # Classifier
+        emissions = self.classifier(lstm_output)
+        
         if labels is not None:
-            if emissions.size(1) != labels.size(1):
-                min_len = min(emissions.size(1), labels.size(1))
-                emissions = emissions[:, :min_len, :]
-                labels = labels[:, :min_len]
-                attention_mask = attention_mask[:, :min_len]
-        
-        # Áp dụng CRF
-        if labels is not None:
-            # Training mode: tính loss
-            batch_loss = self.crf(emissions, labels, attention_mask)
-            # Tính trung bình loss qua batch
-            loss = batch_loss.mean()
+            # Training mode: tính loss với mask đã chuẩn hóa
+            loss = self.crf.neg_log_likelihood(emissions, labels, mask=normalized_mask)
+            logger.debug(f"Training loss: {loss.item():.4f}")
             return loss
         else:
-            # Inference mode: decode chuỗi nhãn có xác suất cao nhất
-            predictions = self.crf.decode(emissions, attention_mask)
+            # Inference mode: decode labels với mask đã chuẩn hóa
+            predictions = self.crf.decode(emissions, mask=normalized_mask)
+            
+            # Cắt predictions theo độ dài thực tế của mỗi câu
+            seq_lengths = normalized_mask.sum(dim=1).tolist()
+            predictions = [pred[:length] for pred, length in zip(predictions, seq_lengths)]
+            
+            logger.debug(f"Decoded {len(predictions)} sequences")
             return predictions
+    
+    def train_epoch(self, dataloader, optimizer, scheduler=None):
+        """Huấn luyện một epoch.
+        
+        Args:
+            dataloader: DataLoader chứa dữ liệu training
+            optimizer: Optimizer
+            scheduler: Learning rate scheduler (optional)
+            
+        Returns:
+            float: Loss trung bình của epoch
+        """
+        self.train()
+        total_loss = 0
+        
+        for batch_idx, (input_embeds, attention_mask, labels) in enumerate(dataloader):
+            # Chuyển dữ liệu lên device
+            input_embeds = input_embeds.to(self.device)
+            attention_mask = attention_mask.to(self.device)
+            labels = labels.to(self.device)
+            
+            # Forward pass
+            loss = self(input_embeds, attention_mask, labels)
+            
+            # Backward pass
+            optimizer.zero_grad()
+            loss.backward()
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(self.parameters(), self.max_grad_norm)
+            
+            # Update weights
+            optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
+            
+            # Cập nhật loss
+            total_loss += loss.item()
+            
+            # Log progress
+            if (batch_idx + 1) % 10 == 0:
+                logger.info(f"Batch {batch_idx + 1}/{len(dataloader)}, Loss: {loss.item():.4f}")
+        
+        return total_loss / len(dataloader)
+    
+    def evaluate(self, dataloader):
+        """Đánh giá mô hình.
+        
+        Args:
+            dataloader: DataLoader chứa dữ liệu validation/test
+            
+        Returns:
+            tuple: (loss trung bình, f1-score)
+        """
+        self.eval()
+        total_loss = 0
+        all_predictions = []
+        all_labels = []
+        
+        with torch.no_grad():
+            for input_embeds, attention_mask, labels in dataloader:
+                # Chuyển dữ liệu lên device
+                input_embeds = input_embeds.to(self.device)
+                attention_mask = attention_mask.to(self.device)
+                labels = labels.to(self.device)
+                
+                # Forward pass
+                loss = self(input_embeds, attention_mask, labels)
+                predictions = self(input_embeds, attention_mask)
+                
+                # Cập nhật loss
+                total_loss += loss.item()
+                
+                # Lưu predictions và labels với mask đã chuẩn hóa
+                normalized_mask = attention_mask.bool()
+                for pred, label, m in zip(predictions, labels, normalized_mask):
+                    valid_pred = [p for p, mask_val in zip(pred, m) if mask_val]
+                    valid_label = [l.item() for l, mask_val in zip(label, m) if mask_val]
+                    all_predictions.extend(valid_pred)
+                    all_labels.extend(valid_label)
+        
+        # Tính F1-score
+        from sklearn.metrics import f1_score
+        f1 = f1_score(all_labels, all_predictions, average='weighted')
+        
+        return total_loss / len(dataloader), f1
+    
+    def fit(
+        self,
+        train_dataloader,
+        val_dataloader=None,
+        num_epochs=10,
+        learning_rate=1e-5,
+        weight_decay=0.01,
+        warmup_steps=None,
+        checkpoint_dir=None
+    ):
+        """Huấn luyện mô hình.
+        
+        Args:
+            train_dataloader: DataLoader cho training
+            val_dataloader: DataLoader cho validation (optional)
+            num_epochs: Số epoch huấn luyện
+            learning_rate: Learning rate
+            weight_decay: Weight decay cho optimizer
+            warmup_steps: Số bước warmup (nếu None, dùng self.warmup_steps)
+            checkpoint_dir: Thư mục lưu checkpoint (optional)
+            
+        Returns:
+            dict: Lịch sử huấn luyện
+        """
+        # Khởi tạo optimizer
+        optimizer = torch.optim.AdamW(
+            self.parameters(),
+            lr=learning_rate,
+            weight_decay=weight_decay
+        )
+        
+        # Khởi tạo scheduler
+        if warmup_steps is None:
+            warmup_steps = self.warmup_steps
+        
+        if warmup_steps > 0:
+            scheduler = get_linear_schedule_with_warmup(
+                optimizer,
+                num_warmup_steps=warmup_steps,
+                num_training_steps=len(train_dataloader) * num_epochs
+            )
+        else:
+            scheduler = ReduceLROnPlateau(
+                optimizer,
+                mode='min',
+                factor=0.5,
+                patience=2,
+                verbose=True
+            )
+        
+        # Khởi tạo early stopping
+        best_val_loss = float('inf')
+        patience_counter = 0
+        best_model_state = None
+        
+        # Lịch sử huấn luyện
+        history = {
+            'train_loss': [],
+            'val_loss': [],
+            'val_f1': []
+        }
+        
+        for epoch in range(num_epochs):
+            logger.info(f"Epoch {epoch + 1}/{num_epochs}")
+            
+            # Training
+            train_loss = self.train_epoch(train_dataloader, optimizer, scheduler)
+            history['train_loss'].append(train_loss)
+            
+            # Validation
+            if val_dataloader is not None:
+                val_loss, val_f1 = self.evaluate(val_dataloader)
+                history['val_loss'].append(val_loss)
+                history['val_f1'].append(val_f1)
+                
+                logger.info(f"Validation Loss: {val_loss:.4f}, F1: {val_f1:.4f}")
+                
+                # Early stopping
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    patience_counter = 0
+                    best_model_state = self.state_dict()
+                    
+                    # Lưu checkpoint
+                    if checkpoint_dir is not None:
+                        self.save_pretrained(f"{checkpoint_dir}/best_model.pt")
+                else:
+                    patience_counter += 1
+                    if patience_counter >= self.early_stopping_patience:
+                        logger.info("Early stopping triggered")
+                        break
+                
+                # Update learning rate (nếu dùng ReduceLROnPlateau)
+                if isinstance(scheduler, ReduceLROnPlateau):
+                    scheduler.step(val_loss)
+            else:
+                logger.info(f"Training Loss: {train_loss:.4f}")
+        
+        # Load best model
+        if best_model_state is not None:
+            self.load_state_dict(best_model_state)
+        
+        return history
+    
+    def save_pretrained(self, path):
+        """Lưu mô hình.
+        
+        Args:
+            path (str): Đường dẫn để lưu mô hình
+        """
+        torch.save({
+            'model_state_dict': self.state_dict(),
+            'bert_hidden_size': self.bert_hidden_size,
+            'kg_hidden_size': self.kg_hidden_size,
+            'lstm_hidden_size': self.lstm_hidden_size,
+            'num_labels': self.num_labels,
+            'start_tag_id': self.start_tag_id,
+            'end_tag_id': self.end_tag_id,
+            'pad_tag_id': self.pad_tag_id,
+            'max_grad_norm': self.max_grad_norm,
+            'warmup_steps': self.warmup_steps,
+            'early_stopping_patience': self.early_stopping_patience
+        }, path)
+        logger.info(f"Đã lưu mô hình tại {path}")
+    
+    @classmethod
+    def from_pretrained(cls, path, device=None):
+        """Load mô hình đã lưu.
+        
+        Args:
+            path (str): Đường dẫn đến file mô hình đã lưu
+            device (torch.device, optional): Thiết bị tính toán
+            
+        Returns:
+            PhoBERT_CRF_KGAN: Mô hình đã được load
+        """
+        checkpoint = torch.load(path, map_location=device)
+        
+        model = cls(
+            bert_hidden_size=checkpoint['bert_hidden_size'],
+            kg_hidden_size=checkpoint['kg_hidden_size'],
+            lstm_hidden_size=checkpoint['lstm_hidden_size'],
+            num_labels=checkpoint['num_labels'],
+            start_tag_id=checkpoint['start_tag_id'],
+            end_tag_id=checkpoint['end_tag_id'],
+            pad_tag_id=checkpoint['pad_tag_id'],
+            max_grad_norm=checkpoint.get('max_grad_norm', 1.0),
+            warmup_steps=checkpoint.get('warmup_steps', 0),
+            early_stopping_patience=checkpoint.get('early_stopping_patience', 3),
+            device=device
+        )
+        
+        model.load_state_dict(checkpoint['model_state_dict'])
+        logger.info(f"Đã load mô hình từ {path}")
+        
+        return model
