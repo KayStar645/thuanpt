@@ -9,6 +9,7 @@ import torch.nn as nn
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from transformers import AutoModel, get_linear_schedule_with_warmup, AutoTokenizer
 from TorchCRF import CRF
+from sklearn.metrics import precision_recall_fscore_support
 from .attention import KGAttention
 from .feedforward import PointWiseFeedForward
 from .squeeze_embedding import SqueezeEmbedding
@@ -264,10 +265,14 @@ class PhoBERT_CRF_KGAN(nn.Module):
             scheduler: Learning rate scheduler (optional)
             
         Returns:
-            float: Loss trung bình của epoch
+            tuple: (loss trung bình, metrics)
+                - loss: float
+                - metrics: dict chứa precision, recall, f1 cho từng class
         """
         self.train()
         total_loss = 0
+        all_predictions = []
+        all_labels = []
         
         for batch_idx, (input_embeds, attention_mask, labels) in enumerate(dataloader):
             # Chuyển dữ liệu lên device
@@ -293,11 +298,57 @@ class PhoBERT_CRF_KGAN(nn.Module):
             # Cập nhật loss
             total_loss += loss.item()
             
+            # Lưu predictions và labels cho metrics
+            with torch.no_grad():
+                predictions = self(input_embeds, attention_mask)
+                normalized_mask = attention_mask.bool()
+                for pred, label, m in zip(predictions, labels, normalized_mask):
+                    valid_pred = [p for p, mask_val in zip(pred, m) if mask_val]
+                    valid_label = [l.item() for l, mask_val in zip(label, m) if mask_val]
+                    all_predictions.extend(valid_pred)
+                    all_labels.extend(valid_label)
+            
             # Log progress
             if (batch_idx + 1) % 10 == 0:
-                logger.info(f"Batch {batch_idx + 1}/{len(dataloader)}, Loss: {loss.item():.4f}")
+                # Tính metrics cho batch hiện tại
+                batch_precision, batch_recall, batch_f1, _ = precision_recall_fscore_support(
+                    all_labels[-len(valid_label):],
+                    all_predictions[-len(valid_pred):],
+                    average='weighted'
+                )
+                logger.info(
+                    f"Batch {batch_idx + 1}/{len(dataloader)}, "
+                    f"Loss: {loss.item():.4f}, "
+                    f"F1: {batch_f1:.4f}, "
+                    f"Precision: {batch_precision:.4f}, "
+                    f"Recall: {batch_recall:.4f}"
+                )
         
-        return total_loss / len(dataloader)
+        # Tính metrics cho toàn bộ epoch
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            all_labels,
+            all_predictions,
+            average=None,
+            labels=range(self.num_labels)
+        )
+        
+        # Tính metrics trung bình (weighted)
+        avg_precision, avg_recall, avg_f1, _ = precision_recall_fscore_support(
+            all_labels,
+            all_predictions,
+            average='weighted'
+        )
+        
+        metrics = {
+            'precision': precision.tolist(),
+            'recall': recall.tolist(),
+            'f1': f1.tolist(),
+            'avg_precision': avg_precision,
+            'avg_recall': avg_recall,
+            'avg_f1': avg_f1
+        }
+        
+        return total_loss / len(dataloader), metrics
     
     def evaluate(self, dataloader):
         """Đánh giá mô hình.
@@ -306,7 +357,9 @@ class PhoBERT_CRF_KGAN(nn.Module):
             dataloader: DataLoader chứa dữ liệu validation/test
             
         Returns:
-            tuple: (loss trung bình, f1-score)
+            tuple: (loss trung bình, metrics)
+                - loss: float
+                - metrics: dict chứa precision, recall, f1 cho từng class
         """
         self.eval()
         total_loss = 0
@@ -335,11 +388,31 @@ class PhoBERT_CRF_KGAN(nn.Module):
                     all_predictions.extend(valid_pred)
                     all_labels.extend(valid_label)
         
-        # Tính F1-score
-        from sklearn.metrics import f1_score
-        f1 = f1_score(all_labels, all_predictions, average='weighted')
+        # Tính metrics
+        precision, recall, f1, _ = precision_recall_fscore_support(
+            all_labels,
+            all_predictions,
+            average=None,
+            labels=range(self.num_labels)
+        )
         
-        return total_loss / len(dataloader), f1
+        # Tính metrics trung bình (weighted)
+        avg_precision, avg_recall, avg_f1, _ = precision_recall_fscore_support(
+            all_labels,
+            all_predictions,
+            average='weighted'
+        )
+        
+        metrics = {
+            'precision': precision.tolist(),
+            'recall': recall.tolist(),
+            'f1': f1.tolist(),
+            'avg_precision': avg_precision,
+            'avg_recall': avg_recall,
+            'avg_f1': avg_f1
+        }
+        
+        return total_loss / len(dataloader), metrics
     
     def fit(
         self,
@@ -399,24 +472,40 @@ class PhoBERT_CRF_KGAN(nn.Module):
         # Lịch sử huấn luyện
         history = {
             'train_loss': [],
+            'train_metrics': [],
             'val_loss': [],
-            'val_f1': []
+            'val_metrics': []
         }
         
         for epoch in range(num_epochs):
             logger.info(f"Epoch {epoch + 1}/{num_epochs}")
             
             # Training
-            train_loss = self.train_epoch(train_dataloader, optimizer, scheduler)
+            train_loss, train_metrics = self.train_epoch(train_dataloader, optimizer, scheduler)
             history['train_loss'].append(train_loss)
+            history['train_metrics'].append(train_metrics)
+            
+            # Log training metrics
+            logger.info(
+                f"Training - Loss: {train_loss:.4f}, "
+                f"F1: {train_metrics['avg_f1']:.4f}, "
+                f"Precision: {train_metrics['avg_precision']:.4f}, "
+                f"Recall: {train_metrics['avg_recall']:.4f}"
+            )
             
             # Validation
             if val_dataloader is not None:
-                val_loss, val_f1 = self.evaluate(val_dataloader)
+                val_loss, val_metrics = self.evaluate(val_dataloader)
                 history['val_loss'].append(val_loss)
-                history['val_f1'].append(val_f1)
+                history['val_metrics'].append(val_metrics)
                 
-                logger.info(f"Validation Loss: {val_loss:.4f}, F1: {val_f1:.4f}")
+                # Log validation metrics
+                logger.info(
+                    f"Validation - Loss: {val_loss:.4f}, "
+                    f"F1: {val_metrics['avg_f1']:.4f}, "
+                    f"Precision: {val_metrics['avg_precision']:.4f}, "
+                    f"Recall: {val_metrics['avg_recall']:.4f}"
+                )
                 
                 # Early stopping
                 if val_loss < best_val_loss:
@@ -436,8 +525,6 @@ class PhoBERT_CRF_KGAN(nn.Module):
                 # Update learning rate (nếu dùng ReduceLROnPlateau)
                 if isinstance(scheduler, ReduceLROnPlateau):
                     scheduler.step(val_loss)
-            else:
-                logger.info(f"Training Loss: {train_loss:.4f}")
         
         # Load best model
         if best_model_state is not None:

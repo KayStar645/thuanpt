@@ -26,9 +26,39 @@ class ABSADataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
         
+        # Label mapping cho sentiment
+        self.sentiment_map = {
+            "POSITIVE": 1,
+            "NEGATIVE": 3,
+            "NEUTRAL": 5
+        }
+        
         # Load dữ liệu
         self.data = self._load_data()
         logger.info(f"Đã load {len(self.data)} mẫu dữ liệu")
+    
+    def _convert_to_bio_labels(self, text, aspects):
+        """Chuyển đổi dữ liệu dạng [start, end, sentiment] sang dạng BIO tagging.
+        
+        Args:
+            text (str): Văn bản gốc
+            aspects (list): Danh sách các aspect dạng [start, end, sentiment]
+            
+        Returns:
+            list: Danh sách các label theo định dạng BIO
+        """
+        # Khởi tạo tất cả labels là "O"
+        labels = ["O"] * len(text)
+        
+        # Đánh dấu các aspect theo định dạng BIO
+        for start, end, sentiment in aspects:
+            # Đánh dấu token đầu tiên là B-
+            labels[start] = f"B-{sentiment}"
+            # Đánh dấu các token còn lại là I-
+            for i in range(start + 1, end):
+                labels[i] = f"I-{sentiment}"
+        
+        return labels
     
     def _load_data(self):
         """Load dữ liệu từ file JSONL."""
@@ -38,8 +68,18 @@ class ABSADataset(Dataset):
         
         with open(train_file, 'r', encoding='utf-8') as f:
             for line in f:
-                item = json.loads(line)
-                data.append(item)
+                try:
+                    item = json.loads(line)
+                    # Chuyển đổi labels sang định dạng BIO
+                    bio_labels = self._convert_to_bio_labels(item['text'], item['labels'])
+                    # Chuyển đổi BIO labels sang ID
+                    item['labels'] = [self.sentiment_map[label.split('-')[1]] if label != "O" else 0 
+                                    for label in bio_labels]
+                    data.append(item)
+                except Exception as e:
+                    logger.error(f"Lỗi khi xử lý dòng: {line.strip()}")
+                    logger.error(f"Chi tiết lỗi: {str(e)}")
+                    raise
         
         return data
     
