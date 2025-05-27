@@ -1,108 +1,93 @@
 """
-Module xử lý dữ liệu cho mô hình ABSA.
+Module chứa các lớp xử lý dữ liệu cho ABSA.
 """
 
-import os
 import json
 import logging
 import torch
 from torch.utils.data import Dataset
+from transformers import AutoTokenizer
 
 # Thiết lập logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class ABSADataset(Dataset):
-    """Dataset cho bài toán Aspect-Based Sentiment Analysis (ABSA).
+    """Dataset cho bài toán ABSA.
     
     Args:
-        data_dir (str): Thư mục chứa dữ liệu
-        tokenizer: Tokenizer của PhoBERT
-        max_length (int): Độ dài tối đa của chuỗi
+        data_dir (str): Đường dẫn đến thư mục chứa dữ liệu
+        tokenizer: Tokenizer để tokenize text
+        max_length (int): Độ dài tối đa của sequence
     """
     
     def __init__(self, data_dir, tokenizer, max_length=128):
-        self.samples = []
-        self.max_length = max_length
+        self.data_dir = data_dir
         self.tokenizer = tokenizer
+        self.max_length = max_length
         
-        # Đọc và xử lý dữ liệu
-        train_file = os.path.join(data_dir, "train.jsonl")
-        if not os.path.exists(train_file):
-            raise FileNotFoundError(f"Không tìm thấy file {train_file}")
-        
-        logger.info(f"Đang đọc dữ liệu từ {train_file}")
-        with open(train_file, "r", encoding="utf-8") as f:
-            for line in f:
-                obj = json.loads(line)
-                text = obj["text"]
-                
-                # Tokenize văn bản
-                inputs = tokenizer(
-                    text,
-                    max_length=max_length,
-                    padding="max_length",
-                    truncation=True,
-                    return_tensors="pt"
-                )
-                
-                # Chuyển đổi labels
-                labels = torch.full_like(
-                    inputs["input_ids"],
-                    -100,  # Ignore index
-                    dtype=torch.long
-                )
-                
-                # Map labels cho các aspect terms
-                for start, end, sentiment in obj["labels"]:
-                    # Tìm các token tương ứng với span [start, end]
-                    span_text = text[start:end]
-                    span_tokens = tokenizer.tokenize(span_text)
-                    
-                    # Tìm vị trí của span tokens trong tokens
-                    for i in range(len(inputs["input_ids"][0])):
-                        if i + len(span_tokens) > len(inputs["input_ids"][0]):
-                            break
-                        
-                        current_tokens = tokenizer.convert_ids_to_tokens(
-                            inputs["input_ids"][0][i:i + len(span_tokens)]
-                        )
-                        if current_tokens == span_tokens:
-                            # Gán nhãn B- cho token đầu tiên
-                            labels[0, i] = self._get_label_id(f"B-{sentiment}")
-                            # Gán nhãn I- cho các token còn lại
-                            for j in range(1, len(span_tokens)):
-                                labels[0, i + j] = self._get_label_id(f"I-{sentiment}")
-                            break
-                
-                # Lưu sample
-                self.samples.append({
-                    "input_ids": inputs["input_ids"][0],
-                    "attention_mask": inputs["attention_mask"][0],
-                    "labels": labels[0]
-                })
-        
-        logger.info(f"Đã load {len(self.samples)} mẫu dữ liệu")
+        # Load dữ liệu
+        self.data = self._load_data()
+        logger.info(f"Đã load {len(self.data)} mẫu dữ liệu")
     
-    def _get_label_id(self, label):
-        """Chuyển đổi nhãn thành ID.
+    def _load_data(self):
+        """Load dữ liệu từ file JSONL."""
+        data = []
+        train_file = f"{self.data_dir}/train.jsonl"
+        logger.info(f"Đang đọc dữ liệu từ {train_file}")
         
-        Args:
-            label (str): Nhãn dạng text (ví dụ: "B-POSITIVE")
-            
-        Returns:
-            int: ID của nhãn
-        """
-        label_map = {
-            "O": 0,
-            "B-POSITIVE": 1, "I-POSITIVE": 2,
-            "B-NEGATIVE": 3, "I-NEGATIVE": 4,
-            "B-NEUTRAL": 5, "I-NEUTRAL": 6
-        }
-        return label_map.get(label, 0)  # Mặc định là O nếu không tìm thấy
+        with open(train_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                item = json.loads(line)
+                data.append(item)
+        
+        return data
     
     def __len__(self):
-        return len(self.samples)
+        return len(self.data)
     
     def __getitem__(self, idx):
-        return self.samples[idx] 
+        """Lấy một mẫu dữ liệu.
+        
+        Returns:
+            tuple: (input_embeds, attention_mask, labels)
+                - input_embeds: Tensor chứa embeddings [seq_len, hidden_size]
+                - attention_mask: Tensor mask [seq_len]
+                - labels: Tensor nhãn [seq_len]
+        """
+        item = self.data[idx]
+        
+        # Tokenize text
+        encoding = self.tokenizer(
+            item['text'],
+            max_length=self.max_length,
+            padding='max_length',
+            truncation=True,
+            return_tensors='pt'
+        )
+        
+        # Lấy input_ids và attention_mask
+        input_ids = encoding['input_ids'].squeeze(0)  # [seq_len]
+        attention_mask = encoding['attention_mask'].squeeze(0)  # [seq_len]
+        
+        # Chuyển đổi labels thành tensor
+        labels = torch.tensor(item['labels'], dtype=torch.long)
+        
+        # Đảm bảo labels có cùng độ dài với input_ids
+        if len(labels) < self.max_length:
+            # Padding labels với -100 (ignore_index)
+            padding = torch.full((self.max_length - len(labels),), -100, dtype=torch.long)
+            labels = torch.cat([labels, padding])
+        else:
+            # Cắt labels nếu dài hơn max_length
+            labels = labels[:self.max_length]
+        
+        # Tạo input embeddings từ input_ids
+        with torch.no_grad():
+            input_embeds = self.tokenizer.convert_ids_to_tokens(input_ids)
+            input_embeds = torch.tensor(
+                [self.tokenizer.convert_tokens_to_ids(t) for t in input_embeds],
+                dtype=torch.long
+            )
+        
+        return input_embeds, attention_mask, labels 

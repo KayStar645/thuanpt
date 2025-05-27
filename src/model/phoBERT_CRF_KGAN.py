@@ -114,12 +114,10 @@ class PhoBERT_CRF_KGAN(nn.Module):
         self.dropout = nn.Dropout(dropout)
         
         # 6. CRF layer
-        self.crf = CRF(
-            num_labels + 2,  # +2 cho START và END
-            start_tag=start_tag_id,
-            end_tag=end_tag_id,
-            pad_tag=pad_tag_id
-        )
+        self.crf = CRF(num_labels + 2)  # +2 cho START và END
+        self.start_tag_id = start_tag_id
+        self.end_tag_id = end_tag_id
+        self.pad_tag_id = pad_tag_id
         
         # Classifier
         self.classifier = nn.Linear(lstm_hidden_size * 2, num_labels + 2)  # *2 cho bidirectional
@@ -221,7 +219,17 @@ class PhoBERT_CRF_KGAN(nn.Module):
         
         # Chuyển đổi tensor để phù hợp với CRF (seq_len, batch_size, num_tags)
         emissions = emissions.transpose(0, 1)
+        
         if labels is not None:
+            # Thêm START và END tags cho labels
+            labels = labels.clone()
+            labels[labels == self.pad_tag_id] = self.end_tag_id
+            labels = torch.cat([
+                torch.full((labels.size(0), 1), self.start_tag_id, device=labels.device),
+                labels
+            ], dim=1)
+            
+            # Chuyển đổi labels và mask
             labels = labels.transpose(0, 1)
             mask = normalized_mask.transpose(0, 1)
             
@@ -236,6 +244,9 @@ class PhoBERT_CRF_KGAN(nn.Module):
             
             # Chuyển đổi lại predictions về dạng batch_first
             predictions = [pred for pred in zip(*predictions)]
+            
+            # Loại bỏ START và END tags
+            predictions = [pred[1:-1] for pred in predictions]
             
             # Cắt predictions theo độ dài thực tế của mỗi câu
             seq_lengths = normalized_mask.sum(dim=1).tolist()
