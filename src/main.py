@@ -1,86 +1,55 @@
 """
-Điểm vào chính cho ứng dụng ABSA.
-Cho phép người dùng chọn chế độ huấn luyện hoặc dự đoán.
+Module chính cho ứng dụng ABSA.
+Cho phép người dùng chọn giữa chế độ training và prediction.
 """
 
 import os
 import argparse
-from src.train import main as train_main
-from src.predict import main as predict_main
+from train import main as train_main
+from predict import main as predict_main
 
 def parse_args():
-    """Phân tích tham số dòng lệnh.
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description='ABSA Training and Prediction')
+    parser.add_argument('--mode', required=True, choices=['train', 'predict'],
+                      help='Chọn chế độ: train hoặc predict')
     
-    Returns:
-        argparse.Namespace: Các tham số đã được phân tích
-    """
-    parser = argparse.ArgumentParser(description="ABSA - Phân tích cảm xúc dựa trên khía cạnh")
+    # Training arguments
+    parser.add_argument('--epochs', type=int, default=10,
+                      help='Số epoch training (mặc định: 10)')
+    parser.add_argument('--batch_size', type=int, default=32,
+                      help='Batch size (mặc định: 32)')
+    parser.add_argument('--learning_rate', type=float, default=1e-5,
+                      help='Learning rate (mặc định: 1e-5)')
     
-    # Tham số chung
-    parser.add_argument(
-        "--mode",
-        type=str,
-        choices=["train", "predict"],
-        required=True,
-        help="Chế độ chạy: train (huấn luyện) hoặc predict (dự đoán)"
-    )
-    
-    # Tham số cho chế độ huấn luyện
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=10,
-        help="Số epoch huấn luyện (mặc định: 10)"
-    )
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=16,
-        help="Kích thước batch (mặc định: 16)"
-    )
-    parser.add_argument(
-        "--learning_rate",
-        type=float,
-        default=1e-5,
-        help="Learning rate (mặc định: 1e-5)"
-    )
-    
-    # Tham số cho chế độ dự đoán
-    parser.add_argument(
-        "--input_file",
-        type=str,
-        help="Đường dẫn đến file input cho chế độ dự đoán"
-    )
-    parser.add_argument(
-        "--output_file",
-        type=str,
-        default="predictions.jsonl",
-        help="Tên file output cho kết quả dự đoán (mặc định: predictions.jsonl)"
-    )
+    # Prediction arguments
+    parser.add_argument('--input_file', type=str,
+                      help='Đường dẫn đến file input cho prediction')
+    parser.add_argument('--output_file', type=str, default='predictions.jsonl',
+                      help='Đường dẫn để lưu kết quả prediction (mặc định: predictions.jsonl)')
     
     return parser.parse_args()
 
 def main():
-    """Hàm chính của ứng dụng."""
-    # Phân tích tham số
+    """Main function."""
     args = parse_args()
     
-    # Kiểm tra thư mục dữ liệu
-    data_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
-    if not os.path.exists(data_dir):
-        os.makedirs(data_dir)
-        print(f"Đã tạo thư mục dữ liệu: {data_dir}")
+    # Tạo thư mục data nếu chưa tồn tại
+    os.makedirs('src/data', exist_ok=True)
     
-    # Chạy chế độ tương ứng
-    if args.mode == "train":
-        print("Bắt đầu huấn luyện mô hình...")
-        train_main()
-    else:  # predict
+    if args.mode == 'train':
+        train_main(
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            learning_rate=args.learning_rate
+        )
+    else:  # predict mode
         if not args.input_file:
-            print("Lỗi: Cần cung cấp file input cho chế độ dự đoán")
-            return
-        print("Bắt đầu dự đoán...")
-        predict_main()
+            raise ValueError("--input_file là bắt buộc trong chế độ predict")
+        predict_main(
+            input_file=args.input_file,
+            output_file=args.output_file
+        )
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
