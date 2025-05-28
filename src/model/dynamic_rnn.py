@@ -36,24 +36,25 @@ class DynamicRNN(nn.Module):
         super(DynamicRNN, self).__init__()
         
         self.input_size = input_size
-        self.hidden_size = hidden_size
+        self.hidden_size = hidden_size  # Giữ nguyên hidden_size
         self.num_layers = num_layers
         self.batch_first = batch_first
         self.bidirectional = bidirectional
         self.rnn_type = rnn_type.lower()
         
-        # Tính toán kích thước thực tế cho hidden state
-        self.hidden_size_per_direction = hidden_size // 2 if bidirectional else hidden_size
+        # Output size sẽ là hidden_size * 2 nếu bidirectional
+        self.output_size = hidden_size * 2 if bidirectional else hidden_size
         
         logger.debug(f"DynamicRNN config - input_size: {input_size}, "
                     f"hidden_size: {hidden_size}, "
-                    f"hidden_size_per_direction: {self.hidden_size_per_direction}")
+                    f"bidirectional: {bidirectional}, "
+                    f"output_size: {self.output_size}")
         
-        # Khởi tạo RNN layer
+        # Khởi tạo RNN layer với hidden_size đầy đủ
         if self.rnn_type == 'lstm':
             self.rnn = nn.LSTM(
                 input_size=input_size,
-                hidden_size=self.hidden_size_per_direction,  # Chia 2 cho bidirectional
+                hidden_size=hidden_size,  # Sử dụng hidden_size đầy đủ
                 num_layers=num_layers,
                 batch_first=batch_first,
                 bidirectional=bidirectional,
@@ -62,7 +63,7 @@ class DynamicRNN(nn.Module):
         elif self.rnn_type == 'gru':
             self.rnn = nn.GRU(
                 input_size=input_size,
-                hidden_size=self.hidden_size_per_direction,  # Chia 2 cho bidirectional
+                hidden_size=hidden_size,  # Sử dụng hidden_size đầy đủ
                 num_layers=num_layers,
                 batch_first=batch_first,
                 bidirectional=bidirectional,
@@ -71,7 +72,7 @@ class DynamicRNN(nn.Module):
         else:
             self.rnn = nn.RNN(
                 input_size=input_size,
-                hidden_size=self.hidden_size_per_direction,  # Chia 2 cho bidirectional
+                hidden_size=hidden_size,  # Sử dụng hidden_size đầy đủ
                 num_layers=num_layers,
                 batch_first=batch_first,
                 bidirectional=bidirectional,
@@ -82,7 +83,8 @@ class DynamicRNN(nn.Module):
                     f"hidden_size={hidden_size}, "
                     f"num_layers={num_layers}, "
                     f"bidirectional={bidirectional}, "
-                    f"rnn_type={rnn_type}")
+                    f"rnn_type={rnn_type}, "
+                    f"output_size={self.output_size}")
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> tuple:
         """Forward pass của DynamicRNN.
@@ -94,7 +96,9 @@ class DynamicRNN(nn.Module):
             
         Returns:
             tuple: (output, (h_n, c_n)) cho LSTM hoặc (output, h_n) cho GRU/RNN
-                output có kích thước (batch_size, seq_len, hidden_size * num_directions)
+                output có kích thước (batch_size, seq_len, output_size)
+                    - output_size = hidden_size * 2 nếu bidirectional
+                    - output_size = hidden_size nếu không bidirectional
         """
         # Log kích thước đầu vào
         logger.debug(f"Input shapes - x: {x.shape}, mask: {mask.shape}")
@@ -142,6 +146,10 @@ class DynamicRNN(nn.Module):
                 batch_first=self.batch_first,
                 total_length=x.size(1)  # Giữ nguyên độ dài ban đầu
             )
+            
+            # Log shape trước khi khôi phục thứ tự
+            logger.debug(f"LSTM output shape before reordering: {output.shape}")
+            
             # Khôi phục lại thứ tự ban đầu
             if self.batch_first:
                 output = output[original_indices]
@@ -160,6 +168,10 @@ class DynamicRNN(nn.Module):
                 batch_first=self.batch_first,
                 total_length=x.size(1)  # Giữ nguyên độ dài ban đầu
             )
+            
+            # Log shape trước khi khôi phục thứ tự
+            logger.debug(f"RNN/GRU output shape before reordering: {output.shape}")
+            
             # Khôi phục lại thứ tự ban đầu
             if self.batch_first:
                 output = output[original_indices]
@@ -169,5 +181,15 @@ class DynamicRNN(nn.Module):
                 h_n = h_n[:, original_indices]
             hidden = h_n
             
-        logger.debug(f"Output shape: {output.shape}")
+        # Log shape cuối cùng và kiểm tra
+        logger.debug(f"Final output shape: {output.shape}")
+        logger.debug(f"Expected output size: {self.output_size}")
+        
+        # Kiểm tra shape cuối cùng
+        if output.size(-1) != self.output_size:
+            raise ValueError(
+                f"Output shape không khớp. Expected last dim: {self.output_size}, "
+                f"Got: {output.size(-1)}"
+            )
+        
         return output, hidden

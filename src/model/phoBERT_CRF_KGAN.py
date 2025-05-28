@@ -78,9 +78,16 @@ class PhoBERT_CRF_KGAN(nn.Module):
         self.warmup_steps = warmup_steps
         self.early_stopping_patience = early_stopping_patience
 
-        # Log số lượng nhãn
-        logger.info(f"Số lượng nhãn (không bao gồm START/END): {num_labels}")
-        logger.info(f"Tổng số nhãn (bao gồm START/END): {num_labels + 2}")
+        # Tính toán kích thước tensor
+        self.combined_size = bert_hidden_size + kg_hidden_size  # 768 + 200 = 968
+        self.bilstm_output_size = lstm_hidden_size * 2  # 256 * 2 = 512
+
+        logger.info(f"Kích thước tensor:")
+        logger.info(f"- BERT hidden size: {bert_hidden_size}")
+        logger.info(f"- KG hidden size: {kg_hidden_size}")
+        logger.info(f"- Combined size: {self.combined_size}")
+        logger.info(f"- BiLSTM output size: {self.bilstm_output_size}")
+        logger.info(f"- Number of labels: {num_labels + 2}")
 
         # 1. PhoBERT
         self.bert = AutoModel.from_pretrained(bert_model_name)
@@ -100,15 +107,15 @@ class PhoBERT_CRF_KGAN(nn.Module):
 
         # 4. FFN
         self.point_wise_ffn = PointWiseFeedForward(
-            d_model=bert_hidden_size + kg_hidden_size,
+            d_model=self.combined_size,
             d_ff=lstm_hidden_size * 4,
             dropout=dropout
         )
 
-        # 5. BiLSTM (256 = 128 mỗi chiều)
+        # 5. BiLSTM
         self.bilstm = DynamicRNN(
-            input_size=bert_hidden_size + kg_hidden_size,
-            hidden_size=256,
+            input_size=self.combined_size,
+            hidden_size=lstm_hidden_size,
             num_layers=2,
             batch_first=True,
             bidirectional=True,
@@ -117,18 +124,10 @@ class PhoBERT_CRF_KGAN(nn.Module):
 
         # Dropout + Classifier + CRF
         self.dropout = nn.Dropout(dropout)
-        # Classifier output size should match number of labels (including START/END)
-        self.classifier = nn.Linear(lstm_hidden_size * 2, num_labels + 2)  # *2 for bidirectional
-        # Initialize CRF with proper number of tags
-        self.crf = CRF(num_labels + 2)  # TorchCRF doesn't support batch_first parameter
-        
-        # Initialize CRF transitions with small values
-        with torch.no_grad():
-            self.crf.transitions.data *= 0.1
-            # Make transitions to START and END tags more likely
-            self.crf.transitions.data[:, self.start_tag_id] *= 0.1
-            self.crf.transitions.data[self.end_tag_id, :] *= 0.1
+        self.classifier = nn.Linear(self.bilstm_output_size, num_labels + 2)
+        self.crf = CRF(num_labels + 2)
 
+        # Khởi tạo trọng số
         self._init_weights()
         logger.info("Khởi tạo mô hình thành công")
 
@@ -147,6 +146,15 @@ class PhoBERT_CRF_KGAN(nn.Module):
         nn.init.xavier_uniform_(self.classifier.weight)
         nn.init.zeros_(self.classifier.bias)
 
+    def _validate_shapes(self, tensor, expected_shape, name):
+        """Kiểm tra shape của tensor."""
+        actual_shape = tensor.shape
+        if actual_shape != expected_shape:
+            raise ValueError(
+                f"Shape không khớp ở {name}. "
+                f"Expected: {expected_shape}, Got: {actual_shape}"
+            )
+
     def forward(self, input_embeds, attention_mask, labels=None):
         """Forward pass của mô hình.
         
@@ -160,71 +168,80 @@ class PhoBERT_CRF_KGAN(nn.Module):
                 - Nếu training: loss tensor
                 - Nếu inference: danh sách các nhãn dự đoán
         """
-        logger.debug(f"Input embeddings shape: {input_embeds.shape}")
-        logger.debug(f"Attention mask shape: {attention_mask.shape}")
+        batch_size, seq_len, _ = input_embeds.shape
+        logger.debug(f"Input shapes - batch_size: {batch_size}, seq_len: {seq_len}")
 
-        # 1. Chuẩn hóa attention mask
+        # Validate input shapes
+        self._validate_shapes(
+            input_embeds, 
+            (batch_size, seq_len, self.bert_hidden_size),
+            "input_embeds"
+        )
+        self._validate_shapes(
+            attention_mask,
+            (batch_size, seq_len),
+            "attention_mask"
+        )
+
         normalized_mask = attention_mask.bool()
 
-        # 2. Tạo KG embeddings và tính attention
-        bert_embeds = input_embeds
-        kg_embeds = self.kg_projection(bert_embeds)
-        kg_attended = self.kg_attention(kg_embeds, normalized_mask)
+        # 1. BERT embeddings (đã có sẵn)
+        bert_output = input_embeds  # (batch_size, seq_len, bert_hidden_size)
+        logger.debug(f"BERT output shape: {bert_output.shape}")
 
-        # 3. Kết hợp và squeeze
-        combined_embeds = torch.cat([bert_embeds, kg_attended], dim=-1)
+        # 2. KG attention
+        kg_embeds = self.kg_projection(bert_output)  # (batch_size, seq_len, kg_hidden_size)
+        self._validate_shapes(kg_embeds, (batch_size, seq_len, self.kg_hidden_size), "kg_embeds")
+        
+        kg_attended = self.kg_attention(kg_embeds, normalized_mask)  # (batch_size, seq_len, kg_hidden_size)
+        self._validate_shapes(kg_attended, (batch_size, seq_len, self.kg_hidden_size), "kg_attended")
+        logger.debug(f"KG attended shape: {kg_attended.shape}")
+
+        # 3. Combine embeddings
+        combined_embeds = torch.cat([bert_output, kg_attended], dim=-1)  # (batch_size, seq_len, combined_size)
+        self._validate_shapes(combined_embeds, (batch_size, seq_len, self.combined_size), "combined_embeds")
+        logger.debug(f"Combined embeddings shape: {combined_embeds.shape}")
+
+        # 4. Squeeze embeddings
         squeezed_embeds = self.squeeze_embedding(combined_embeds, normalized_mask)
+        self._validate_shapes(squeezed_embeds, (batch_size, seq_len, self.combined_size), "squeezed_embeds")
+        logger.debug(f"Squeezed embeddings shape: {squeezed_embeds.shape}")
 
-        # 4. FFN + BiLSTM + Dropout + Linear
-        ffn_output = self.point_wise_ffn(squeezed_embeds)
-        lstm_output, _ = self.bilstm(ffn_output, normalized_mask)
+        # 5. FFN
+        ffn_output = self.point_wise_ffn(squeezed_embeds)  # (batch_size, seq_len, combined_size)
+        self._validate_shapes(ffn_output, (batch_size, seq_len, self.combined_size), "ffn_output")
+        logger.debug(f"FFN output shape: {ffn_output.shape}")
+
+        # 6. BiLSTM
+        lstm_output, _ = self.bilstm(ffn_output, normalized_mask)  # (batch_size, seq_len, bilstm_output_size)
+        self._validate_shapes(lstm_output, (batch_size, seq_len, self.bilstm_output_size), "lstm_output")
+        logger.debug(f"LSTM output shape: {lstm_output.shape}")
+
+        # 7. Dropout
         lstm_output = self.dropout(lstm_output)
-        emissions = self.classifier(lstm_output)
+        self._validate_shapes(lstm_output, (batch_size, seq_len, self.bilstm_output_size), "lstm_output after dropout")
 
-        # Debug log emissions
+        # 8. Classifier
+        emissions = self.classifier(lstm_output)  # (batch_size, seq_len, num_labels + 2)
+        self._validate_shapes(emissions, (batch_size, seq_len, self.num_labels + 2), "emissions")
         logger.debug(f"Emissions shape: {emissions.shape}")
-        logger.debug(f"Emissions min/max/mean: {emissions.min().item():.4f}/{emissions.max().item():.4f}/{emissions.mean().item():.4f}")
 
-        # 5. Tính loss hoặc decode
         if labels is not None:
+            self._validate_shapes(labels, (batch_size, seq_len), "labels")
             labels = labels.clone()
             labels[labels == self.pad_tag_id] = self.end_tag_id
-            
-            # Debug log labels
-            logger.debug(f"Labels shape: {labels.shape}")
-            logger.debug(f"Unique labels: {torch.unique(labels).tolist()}")
-            
-            # CRF expects (seq_len, batch_size, num_tags) for emissions
-            # and (seq_len, batch_size) for labels
-            emissions = emissions.transpose(0, 1)  # (batch, seq, tags) -> (seq, batch, tags)
-            labels = labels.transpose(0, 1)  # (batch, seq) -> (seq, batch)
-            mask = normalized_mask.transpose(0, 1)  # (batch, seq) -> (seq, batch)
-            
-            # CRF returns negative log likelihood
+            emissions = emissions.transpose(0, 1)  # (seq_len, batch_size, num_labels + 2)
+            labels = labels.transpose(0, 1)  # (seq_len, batch_size)
+            mask = normalized_mask.transpose(0, 1)  # (seq_len, batch_size)
             loss = self.crf(emissions, labels, mask=mask)
-            # Take mean of loss across batch
-            loss = loss.mean()
-            logger.debug(f"Raw CRF loss: {loss.item():.4f}")
-            return loss
+            return loss.mean()
         else:
-            # CRF expects (seq_len, batch_size, num_tags) for emissions
-            emissions = emissions.transpose(0, 1)  # (batch, seq, tags) -> (seq, batch, tags)
-            mask = normalized_mask.transpose(0, 1)  # (batch, seq) -> (seq, batch)
-            
-            # Use viterbi_decode for predictions
+            emissions = emissions.transpose(0, 1)  # (seq_len, batch_size, num_labels + 2)
+            mask = normalized_mask.transpose(0, 1)  # (seq_len, batch_size)
             predictions = self.crf.viterbi_decode(emissions, mask=mask)
-            # Convert predictions back to batch-first format
-            predictions = [pred for pred in zip(*predictions)]  # Transpose back to (batch, seq)
+            predictions = [pred for pred in zip(*predictions)]
             seq_lengths = normalized_mask.sum(dim=1).tolist()
-            predictions = [pred[:length] for pred, length in zip(predictions, seq_lengths)]
-            
-            # Debug log predictions
-            logger.debug(f"Number of sequences decoded: {len(predictions)}")
-            if predictions:
-                logger.debug(f"Sample prediction lengths: {[len(p) for p in predictions[:5]]}")
-                logger.debug(f"Sample predictions: {predictions[:5]}")
-            
-            return predictions
+            return [pred[:l] for pred, l in zip(predictions, seq_lengths)]
 
     def fit(
         self,
