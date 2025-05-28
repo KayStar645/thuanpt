@@ -346,10 +346,10 @@ def main():
             # Save best model
             save_model(
                 model=model,
-                output_dir=args.output_dir,
+                optimizer=optimizer,
+                scheduler=scheduler,
                 step=len(train_dataloader),
-                epoch=epoch + 1,
-                is_best=True
+                output_dir=args.output_dir
             )
             logger.info(f"New best model saved! F1: {best_f1:.4f}")
         else:
@@ -362,9 +362,10 @@ def main():
         # Save checkpoint
         save_model(
             model=model,
-            output_dir=args.output_dir,
+            optimizer=optimizer,
+            scheduler=scheduler,
             step=len(train_dataloader),
-            epoch=epoch + 1
+            output_dir=args.output_dir
         )
     
     logger.info("\nTraining completed!")

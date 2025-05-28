@@ -7,6 +7,7 @@ import logging
 import torch
 from torch.utils.data import Dataset
 from transformers import AutoTokenizer, AutoModel, PreTrainedTokenizer
+from typing import Dict, List, Optional, Tuple
 
 # Thiết lập logging
 logging.basicConfig(level=logging.INFO)
@@ -22,7 +23,7 @@ class ABSADataset(Dataset):
         bert_model_name (str): Tên mô hình BERT để tạo embeddings
     """
     
-    def __init__(self, data_dir, tokenizer, max_length=512, bert_model_name="vinai/phobert-base"):
+    def __init__(self, data_dir: str, tokenizer: PreTrainedTokenizer, max_length: int = 512, bert_model_name: str = "vinai/phobert-base"):
         self.data_dir = data_dir
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -38,11 +39,11 @@ class ABSADataset(Dataset):
             "NEUTRAL": 5
         }
         
-        # Load dữ liệu
-        self.data = self._load_data()
-        logger.info(f"Đã load {len(self.data)} mẫu dữ liệu")
+        # Load và preprocess dữ liệu
+        self.data = self._load_and_preprocess_data()
+        logger.info(f"Đã load và preprocess {len(self.data)} mẫu dữ liệu")
     
-    def _convert_to_bio_labels(self, text, aspects):
+    def _convert_to_bio_labels(self, text: str, aspects: List[Tuple[int, int, str]]) -> List[str]:
         """Chuyển đổi dữ liệu dạng [start, end, sentiment] sang dạng BIO tagging.
         
         Args:
@@ -57,6 +58,9 @@ class ABSADataset(Dataset):
         
         # Đánh dấu các aspect theo định dạng BIO
         for start, end, sentiment in aspects:
+            if start >= len(text) or end > len(text):
+                logger.warning(f"Invalid aspect span: start={start}, end={end}, text_len={len(text)}")
+                continue
             # Đánh dấu token đầu tiên là B-
             labels[start] = f"B-{sentiment}"
             # Đánh dấu các token còn lại là I-
@@ -64,108 +68,209 @@ class ABSADataset(Dataset):
                 labels[i] = f"I-{sentiment}"
         
         return labels
-    
-    def _load_data(self):
-        """Load dữ liệu từ file JSONL."""
-        data = []
-        train_file = f"{self.data_dir}/train.jsonl"
-        logger.info(f"Đang đọc dữ liệu từ {train_file}")
+
+    def _preprocess_text_and_labels(self, text: str, labels: List[str]) -> Tuple[List[int], List[int], List[int], int]:
+        """Preprocess text và labels để đảm bảo độ dài phù hợp.
         
-        with open(train_file, 'r', encoding='utf-8') as f:
-            for line in f:
-                try:
-                    item = json.loads(line)
-                    # Đảm bảo labels có độ dài bằng max_length
-                    if len(item['labels']) < self.max_length:
-                        item['labels'].extend([2] * (self.max_length - len(item['labels'])))  # Padding với O tag
-                    else:
-                        item['labels'] = item['labels'][:self.max_length]  # Cắt bớt nếu dài hơn
-                    data.append(item)
-                except Exception as e:
-                    logger.error(f"Lỗi khi xử lý dòng: {line.strip()}")
-                    logger.error(f"Chi tiết lỗi: {str(e)}")
-                    continue
-        
-        return data
-    
-    def __len__(self):
-        return len(self.data)
-    
-    def __getitem__(self, idx):
-        """Lấy một mẫu dữ liệu.
-        
+        Args:
+            text (str): Văn bản gốc
+            labels (List[str]): Labels dạng BIO
+            
         Returns:
-            dict: Dictionary chứa các tensor:
-                - input_ids: Token ids [max_length]
-                - attention_mask: Attention mask [max_length]
-                - labels: Labels [max_length]
-                - id: ID của mẫu
+            Tuple[List[int], List[int], List[int], int]: 
+                - input_ids: Token ids
+                - attention_mask: Attention mask
+                - labels: Labels đã chuyển đổi sang số
+                - actual_length: Độ dài thực tế của sequence
         """
-        item = self.data[idx]
-        
-        # Tokenize text với padding và truncation
+        # Tokenize text
         encoding = self.tokenizer(
-            item['text'],
+            text,
             max_length=self.max_length,
             padding='max_length',
             truncation=True,
             return_tensors='pt'
         )
         
-        # Lấy các tensors và đảm bảo chúng có shape [max_length]
-        input_ids = encoding['input_ids'].squeeze(0)  # [max_length]
-        attention_mask = encoding['attention_mask'].squeeze(0)  # [max_length]
+        # Lấy độ dài thực tế (không tính padding)
+        actual_length = (encoding['input_ids'][0] != self.tokenizer.pad_token_id).sum().item()
         
-        # Chuyển đổi labels thành tensor và đảm bảo độ dài
-        labels = torch.tensor(item['labels'], dtype=torch.long)
-        if len(labels) < self.max_length:
-            labels = torch.nn.functional.pad(labels, (0, self.max_length - len(labels)), value=2)
-        else:
-            labels = labels[:self.max_length]
+        # Chuyển đổi labels sang số và pad/truncate
+        label_ids = []
+        for label in labels[:actual_length]:
+            if label == "O":
+                label_ids.append(2)  # O tag
+            elif label.startswith("B-"):
+                label_ids.append(self.sentiment_map.get(label[2:], 2))
+            elif label.startswith("I-"):
+                label_ids.append(self.sentiment_map.get(label[2:], 2))
+            else:
+                label_ids.append(2)  # Unknown tag -> O
         
-        # Đảm bảo tất cả tensors có cùng độ dài
-        assert len(input_ids) == self.max_length, f"input_ids length {len(input_ids)} != {self.max_length}"
-        assert len(attention_mask) == self.max_length, f"attention_mask length {len(attention_mask)} != {self.max_length}"
-        assert len(labels) == self.max_length, f"labels length {len(labels)} != {self.max_length}"
+        # Pad labels với O tag (2)
+        if len(label_ids) < self.max_length:
+            label_ids.extend([2] * (self.max_length - len(label_ids)))
         
-        return {
-            'input_ids': input_ids,
-            'attention_mask': attention_mask,
-            'labels': labels,
-            'id': item['id']
-        }
+        return (
+            encoding['input_ids'][0].tolist(),
+            encoding['attention_mask'][0].tolist(),
+            label_ids,
+            actual_length
+        )
     
-    def collate_fn(self, batch):
-        """Hàm để gộp các mẫu thành batch.
+    def _load_and_preprocess_data(self) -> List[Dict]:
+        """Load và preprocess dữ liệu từ file JSONL."""
+        data = []
+        train_file = f"{self.data_dir}/train.jsonl"
+        logger.info(f"Đang đọc và preprocess dữ liệu từ {train_file}")
+        
+        with open(train_file, 'r', encoding='utf-8') as f:
+            for line_num, line in enumerate(f, 1):
+                try:
+                    item = json.loads(line)
+                    text = item['text']
+                    aspects = item.get('aspects', [])
+                    
+                    # Chuyển đổi sang BIO labels
+                    bio_labels = self._convert_to_bio_labels(text, aspects)
+                    
+                    # Preprocess text và labels
+                    input_ids, attention_mask, label_ids, actual_length = self._preprocess_text_and_labels(
+                        text, bio_labels
+                    )
+                    
+                    # Validate độ dài
+                    assert len(input_ids) == self.max_length, \
+                        f"input_ids length {len(input_ids)} != {self.max_length}"
+                    assert len(attention_mask) == self.max_length, \
+                        f"attention_mask length {len(attention_mask)} != {self.max_length}"
+                    assert len(label_ids) == self.max_length, \
+                        f"labels length {len(label_ids)} != {self.max_length}"
+                    
+                    # Lưu thông tin đã xử lý
+                    processed_item = {
+                        'id': item['id'],
+                        'text': text,
+                        'input_ids': input_ids,
+                        'attention_mask': attention_mask,
+                        'labels': label_ids,
+                        'actual_length': actual_length
+                    }
+                    
+                    data.append(processed_item)
+                    
+                except Exception as e:
+                    logger.error(f"Lỗi khi xử lý dòng {line_num}: {str(e)}")
+                    logger.error(f"Text: {text[:100]}...")
+                    continue
+        
+        logger.info(f"Đã load và preprocess {len(data)} mẫu dữ liệu")
+        return data
+    
+    def __len__(self) -> int:
+        return len(self.data)
+    
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        """Lấy một mẫu từ dataset.
         
         Args:
-            batch (list): Danh sách các mẫu
+            idx: Index của mẫu cần lấy
+        
+        Returns:
+            Dict[str, torch.Tensor]: Dictionary chứa các tensor:
+                - input_ids: Token ids [max_length]
+                - attention_mask: Attention mask [max_length]
+                - labels: Labels [max_length]
+                - id: ID của mẫu
+        """
+        try:
+            item = self.data[idx]
+            
+            # Convert lists to tensors
+            input_ids = torch.tensor(item['input_ids'], dtype=torch.long)
+            attention_mask = torch.tensor(item['attention_mask'], dtype=torch.long)
+            labels = torch.tensor(item['labels'], dtype=torch.long)
+            
+            # Validate tensor sizes
+            assert input_ids.shape[0] == self.max_length, \
+                f"input_ids shape {input_ids.shape} != ({self.max_length},)"
+            assert attention_mask.shape[0] == self.max_length, \
+                f"attention_mask shape {attention_mask.shape} != ({self.max_length},)"
+            assert labels.shape[0] == self.max_length, \
+                f"labels shape {labels.shape} != ({self.max_length},)"
+            
+            # Validate padding
+            pad_mask = (input_ids == self.tokenizer.pad_token_id)
+            assert torch.all(labels[pad_mask] == 2), \
+                "Labels should be 2 (O tag) for padding tokens"
+            
+            return {
+                'id': item['id'],
+                'input_ids': input_ids,
+                'attention_mask': attention_mask,
+                'labels': labels
+            }
+            
+        except Exception as e:
+            logger.error(f"Error processing sample {idx}: {str(e)}")
+            if 'item' in locals():
+                logger.error(f"Text: {item.get('text', '')[:100]}...")
+                logger.error(f"Labels length: {len(item.get('labels', []))}")
+                logger.error(f"Actual length: {item.get('actual_length', 'N/A')}")
+            raise e
+    
+    def collate_fn(self, batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        """Gộp các mẫu thành một batch.
+        
+        Args:
+            batch: List các dictionary chứa tensors
             
         Returns:
-            dict: Dictionary chứa batched tensors và non-tensor fields
+            Dict[str, torch.Tensor]: Batch đã được gộp
         """
-        # Tách tensor fields và non-tensor fields
-        tensor_fields = ['input_ids', 'attention_mask', 'labels']
-        non_tensor_fields = ['id']
-        
-        # Stack các tensors và đảm bảo chúng có cùng shape
-        tensor_batch = {}
-        for field in tensor_fields:
-            tensors = [item[field] for item in batch]
-            # Kiểm tra shape của mỗi tensor
-            for i, tensor in enumerate(tensors):
-                if tensor.shape[0] != self.max_length:
-                    raise ValueError(
-                        f"Tensor {field} at index {i} has length {tensor.shape[0]}, "
-                        f"expected {self.max_length}"
-                    )
-            tensor_batch[field] = torch.stack(tensors)
-        
-        # Giữ nguyên các non-tensor fields
-        non_tensor_batch = {
-            field: [item[field] for item in batch]
-            for field in non_tensor_fields
-        }
-        
-        # Kết hợp cả hai
-        return {**tensor_batch, **non_tensor_batch} 
+        try:
+            # Validate batch size
+            batch_size = len(batch)
+            if batch_size == 0:
+                raise ValueError("Empty batch")
+            
+            # Tách tensor fields và non-tensor fields
+            tensor_fields = ['input_ids', 'attention_mask', 'labels']
+            non_tensor_fields = ['id']
+            
+            # Stack tensors
+            tensor_batch = {}
+            for field in tensor_fields:
+                tensors = [item[field] for item in batch]
+                # Validate tensor shapes trước khi stack
+                for i, tensor in enumerate(tensors):
+                    if tensor.shape[0] != self.max_length:
+                        raise ValueError(
+                            f"Tensor {field} at index {i} has length {tensor.shape[0]}, "
+                            f"expected {self.max_length}"
+                        )
+                tensor_batch[field] = torch.stack(tensors)
+            
+            # Keep non-tensor fields as lists
+            non_tensor_batch = {
+                field: [item[field] for item in batch]
+                for field in non_tensor_fields
+            }
+            
+            # Validate final batch shapes
+            for field in tensor_fields:
+                tensor = tensor_batch[field]
+                assert tensor.shape == (batch_size, self.max_length), \
+                    f"{field} shape {tensor.shape} != ({batch_size}, {self.max_length})"
+            
+            return {**tensor_batch, **non_tensor_batch}
+            
+        except Exception as e:
+            logger.error(f"Error in collate_fn: {str(e)}")
+            logger.error(f"Batch size: {len(batch)}")
+            for i, item in enumerate(batch):
+                logger.error(f"Item {i} shapes:")
+                for k, v in item.items():
+                    if isinstance(v, torch.Tensor):
+                        logger.error(f"- {k}: {v.shape}")
+            raise e 

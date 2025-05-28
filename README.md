@@ -15,7 +15,7 @@ cd <repository_name>
 python -m venv venv
 source venv/bin/activate  # Linux/Mac
 # hoặc
-.\venv\Scripts\activate  # Windows
+source venv/Scripts/activate  # Windows
 
 pip install -r requirements.txt
 ```
