@@ -1,106 +1,271 @@
 """
-Module huấn luyện mô hình ABSA.
+Script training cho mô hình ABSA.
 """
 
 import os
-import logging
+import yaml
 import torch
-from torch.utils.data import DataLoader, random_split
+import logging
+import argparse
+from pathlib import Path
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import get_linear_schedule_with_warmup
 from transformers import AutoTokenizer
-from src.model import PhoBERT_CRF_KGAN
-from src.utils.data_loader import ABSADataset
-from src.utils.preprocess import preprocess_text
+from tqdm import tqdm
+
+from model.phoBERT_CRF_KGAN import PhoBERT_CRF_KGAN
+from data.dataset import create_dataloader
+from utils.metrics import compute_metrics
+from utils.training import set_seed, save_model, load_model
 
 # Thiết lập logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def main(epochs=10, batch_size=32, learning_rate=1e-5):
-    """Huấn luyện mô hình ABSA.
+def train_epoch(
+    model: PhoBERT_CRF_KGAN,
+    train_loader: torch.utils.data.DataLoader,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    device: torch.device,
+    config: dict
+) -> float:
+    """Training một epoch.
     
     Args:
-        epochs (int): Số epoch huấn luyện
-        batch_size (int): Kích thước batch
-        learning_rate (float): Learning rate
+        model: Model cần train
+        train_loader: DataLoader cho dữ liệu training
+        optimizer: Optimizer
+        scheduler: Learning rate scheduler
+        device: Device để train
+        config: Cấu hình training
+        
+    Returns:
+        float: Loss trung bình của epoch
     """
-    # Thiết lập device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Sử dụng device: {device}")
+    model.train()
+    total_loss = 0
     
-    # Khởi tạo tokenizer
-    tokenizer = AutoTokenizer.from_pretrained("vinai/phobert-base")
+    progress_bar = tqdm(train_loader, desc="Training")
+    for step, batch in enumerate(progress_bar):
+        # Chuyển batch lên device
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        labels = batch['labels'].to(device)
+        
+        # Forward pass
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels
+        )
+        loss = outputs.loss
+        
+        # Backward pass
+        loss.backward()
+        
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            config['model']['max_grad_norm']
+        )
+        
+        # Update weights
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad()
+        
+        # Update progress bar
+        total_loss += loss.item()
+        progress_bar.set_postfix({
+            'loss': f"{loss.item():.4f}",
+            'avg_loss': f"{total_loss/(step+1):.4f}"
+        })
+        
+        # Log và lưu model
+        if (step + 1) % config['training']['logging_steps'] == 0:
+            logger.info(
+                f"Step {step+1}: loss = {loss.item():.4f}, "
+                f"avg_loss = {total_loss/(step+1):.4f}"
+            )
+        
+        if (step + 1) % config['training']['save_steps'] == 0:
+            save_model(
+                model,
+                optimizer,
+                scheduler,
+                step + 1,
+                config['data']['output_dir']
+            )
     
-    # Khởi tạo dataset
-    full_dataset = ABSADataset(
-        data_dir="src/data/origin",
-        tokenizer=tokenizer,
-        max_length=128
+    return total_loss / len(train_loader)
+
+def evaluate(
+    model: PhoBERT_CRF_KGAN,
+    eval_loader: torch.utils.data.DataLoader,
+    device: torch.device
+) -> dict:
+    """Đánh giá model.
+    
+    Args:
+        model: Model cần đánh giá
+        eval_loader: DataLoader cho dữ liệu evaluation
+        device: Device để evaluate
+        
+    Returns:
+        dict: Các metrics đánh giá
+    """
+    model.eval()
+    all_preds = []
+    all_labels = []
+    
+    with torch.no_grad():
+        for batch in tqdm(eval_loader, desc="Evaluating"):
+            # Chuyển batch lên device
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].to(device)
+            
+            # Forward pass
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask
+            )
+            preds = outputs.predictions
+            
+            # Lưu predictions và labels
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+    
+    # Tính metrics
+    metrics = compute_metrics(all_preds, all_labels)
+    return metrics
+
+def main():
+    """Hàm chính để training model."""
+    parser = argparse.ArgumentParser(description="Training mô hình ABSA")
+    parser.add_argument(
+        "--config",
+        type=str,
+        required=True,
+        help="Đường dẫn file cấu hình"
     )
-    
-    # Chia dataset thành train và validation (90-10)
-    val_size = int(len(full_dataset) * 0.1)
-    train_size = len(full_dataset) - val_size
-    train_dataset, val_dataset = random_split(
-        full_dataset, 
-        [train_size, val_size],
-        generator=torch.Generator().manual_seed(42)
+    parser.add_argument(
+        "--train_file",
+        type=str,
+        required=True,
+        help="File dữ liệu training"
     )
-    
-    logger.info(f"Kích thước tập train: {len(train_dataset)}")
-    logger.info(f"Kích thước tập validation: {len(val_dataset)}")
-    
-    # Khởi tạo dataloaders
-    train_dataloader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=4
+    parser.add_argument(
+        "--val_file",
+        type=str,
+        required=True,
+        help="File dữ liệu validation"
     )
-    
-    val_dataloader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=4
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        required=True,
+        help="Thư mục lưu model"
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed"
+    )
+    args = parser.parse_args()
+    
+    # Đọc cấu hình
+    with open(args.config, 'r', encoding='utf-8') as f:
+        config = yaml.safe_load(f)
+    
+    # Set seed
+    set_seed(args.seed)
+    
+    # Tạo thư mục output
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     
     # Khởi tạo model
-    model = PhoBERT_CRF_KGAN(
-        bert_model_name="vinai/phobert-base",
-        num_labels=7,  # Số lượng nhãn trong tập dữ liệu
-        device=device,
-        warmup_steps=len(train_dataloader) // 2  # Warmup trong nửa epoch đầu
+    device = torch.device(config['training']['device'])
+    model = PhoBERT_CRF_KGAN(config['model']).to(device)
+    
+    # Tạo dataloader
+    train_loader = create_dataloader(
+        args.train_file,
+        tokenizer_name=config['model']['bert_model_name'],
+        max_length=config['training']['max_length'],
+        batch_size=config['training']['batch_size'],
+        num_workers=config['training']['num_workers']
     )
     
-    # Tạo thư mục checkpoints nếu chưa tồn tại
-    checkpoint_dir = "src/data/checkpoints"
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    
-    # Huấn luyện model
-    logger.info("Bắt đầu huấn luyện...")
-    history = model.fit(
-        train_dataloader=train_dataloader,
-        val_dataloader=val_dataloader,  # Thêm validation dataloader
-        num_epochs=epochs,
-        learning_rate=learning_rate,
-        checkpoint_dir=checkpoint_dir
+    val_loader = create_dataloader(
+        args.val_file,
+        tokenizer_name=config['model']['bert_model_name'],
+        max_length=config['training']['max_length'],
+        batch_size=config['training']['batch_size'],
+        shuffle=False,
+        num_workers=config['training']['num_workers']
     )
     
-    # Lưu model
-    model_dir = "src/data/model"
-    os.makedirs(model_dir, exist_ok=True)
-    model.save_pretrained(os.path.join(model_dir, "phobert_crf_kgan.pt"))
-    logger.info("Đã lưu model thành công")
+    # Khởi tạo optimizer và scheduler
+    optimizer = AdamW(
+        model.parameters(),
+        lr=config['training']['learning_rate'],
+        weight_decay=config['training']['weight_decay']
+    )
     
-    # Log kết quả cuối cùng
-    logger.info("Kết quả huấn luyện:")
-    logger.info(f"Train loss cuối cùng: {history['train_loss'][-1]:.4f}")
-    if 'val_loss' in history:
-        logger.info(f"Validation loss cuối cùng: {history['val_loss'][-1]:.4f}")
-        logger.info(f"Validation F1 cuối cùng: {history['val_f1'][-1]:.4f}")
+    num_training_steps = len(train_loader) * config['training']['num_epochs']
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=config['model']['warmup_steps'],
+        num_training_steps=num_training_steps
+    )
+    
+    # Training
+    best_f1 = 0
+    patience_counter = 0
+    
+    for epoch in range(config['training']['num_epochs']):
+        logger.info(f"Epoch {epoch+1}/{config['training']['num_epochs']}")
+        
+        # Training
+        train_loss = train_epoch(
+            model,
+            train_loader,
+            optimizer,
+            scheduler,
+            device,
+            config
+        )
+        logger.info(f"Training loss: {train_loss:.4f}")
+        
+        # Evaluation
+        metrics = evaluate(model, val_loader, device)
+        logger.info(f"Validation metrics: {metrics}")
+        
+        # Lưu model tốt nhất
+        if metrics['f1'] > best_f1:
+            best_f1 = metrics['f1']
+            save_model(
+                model,
+                optimizer,
+                scheduler,
+                epoch + 1,
+                output_dir,
+                is_best=True
+            )
+            patience_counter = 0
+        else:
+            patience_counter += 1
+        
+        # Early stopping
+        if patience_counter >= config['model']['early_stopping_patience']:
+            logger.info("Early stopping triggered")
+            break
+    
+    logger.info("Training completed!")
 
 if __name__ == "__main__":
     main()

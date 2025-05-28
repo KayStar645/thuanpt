@@ -1,0 +1,40 @@
+# Cấu hình model
+model:
+  bert_model_name: "vinai/phobert-base"
+  num_labels: 9  # START, END, O, B-POS, I-POS, B-NEG, I-NEG, B-NEU, I-NEU
+  bert_hidden_size: 768
+  kg_hidden_size: 200
+  lstm_hidden_size: 256
+  lstm_num_layers: 2
+  dropout: 0.1
+  max_grad_norm: 1.0
+  warmup_steps: 0
+  early_stopping_patience: 3
+
+# Cấu hình training
+training:
+  batch_size: 16
+  learning_rate: 1e-5
+  weight_decay: 0.01
+  num_epochs: 3
+  device: "cuda"  # hoặc "cpu"
+  num_workers: 4
+  logging_steps: 100
+  save_steps: 1000
+  eval_steps: 500
+  max_length: 512
+  seed: 42
+
+# Cấu hình data
+data:
+  train_file: "src/data/processed/train.jsonl"
+  val_file: "src/data/processed/val.jsonl"
+  test_file: "src/data/processed/test.jsonl"
+  output_dir: "models/"
+  predictions_dir: "src/data/predictions/"
+
+# Cấu hình logging
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "logs/training.log" 
