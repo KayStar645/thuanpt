@@ -37,6 +37,8 @@ pip install -r requirements.txt
 │   │   └── phoBERT_CRF_KGAN.py  # Model ABSA
 │   ├── utils/
 │   │   ├── metrics.py      # Metrics đánh giá
+│   │   ├── preprocess.py   # Tiền xử lý dữ liệu
+│   │   ├── reprocess_data.py # Xử lý lại dữ liệu với độ dài chuẩn hóa
 │   │   └── training.py     # Utilities cho training
 │   └── train.py            # Script training
 ├── models/                  # Thư mục lưu model
@@ -57,7 +59,7 @@ pip install -r requirements.txt
 }
 ```
 
-2. Tiền xử lý dữ liệu:
+2. Tiền xử lý dữ liệu ban đầu:
 ```bash
 python src/utils/preprocess.py \
     --input_file src/data/origin/train.jsonl \
@@ -69,11 +71,25 @@ Các tham số tiền xử lý:
 - `--output_file`: Đường dẫn file dữ liệu đã xử lý
 - `--max_samples`: Số lượng mẫu tối đa cần xử lý (tùy chọn)
 
-3. Tạo tập validation:
+3. Xử lý lại dữ liệu với độ dài chuẩn hóa:
+```bash
+python -m src.utils.reprocess_data \
+    --input_file src/data/processed/train_new.jsonl \
+    --output_file src/data/processed/train_processed.jsonl
+```
+
+Script này sẽ:
+- Đảm bảo độ dài labels luôn bằng 512 (độ dài tối đa của input_ids)
+- Padding labels với O tag (2) nếu ngắn hơn 512
+- Truncate labels nếu dài hơn 512
+- Bỏ qua các mẫu có độ dài labels không đúng
+- Ghi log các mẫu bị lỗi trong quá trình xử lý
+
+4. Tạo tập validation:
 ```bash
 # Tách dữ liệu training thành train và validation
-head -n 500 src/data/processed/train_new.jsonl > src/data/processed/val.jsonl
-tail -n +501 src/data/processed/train_new.jsonl > src/data/processed/train.jsonl
+head -n 500 src/data/processed/train_processed.jsonl > src/data/processed/val.jsonl
+tail -n +501 src/data/processed/train_processed.jsonl > src/data/processed/train.jsonl
 ```
 
 ## Training model

@@ -72,7 +72,7 @@ def create_crf_labels(
         tokens = tokens[:max_length-2]
     
     # Khởi tạo labels với O
-    labels = [2] * len(tokens)
+    labels = [2] * (max_length - 2)  # -2 cho START và END tags
     
     # Đánh dấu các khía cạnh
     for aspect in aspects:
@@ -97,11 +97,17 @@ def create_crf_labels(
         
         # Đánh dấu vị trí bắt đầu và kết thúc
         labels[start] = b_label
-        for i in range(start + 1, end):
+        for i in range(start + 1, min(end, len(tokens))):
             labels[i] = i_label
     
     # Thêm START và END tags
     labels = [0] + labels + [1]
+    
+    # Đảm bảo độ dài bằng max_length
+    if len(labels) < max_length:
+        labels.extend([2] * (max_length - len(labels)))  # Padding với O tag
+    else:
+        labels = labels[:max_length]
     
     return labels
 

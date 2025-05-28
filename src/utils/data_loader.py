@@ -22,7 +22,7 @@ class ABSADataset(Dataset):
         bert_model_name (str): Tên mô hình BERT để tạo embeddings
     """
     
-    def __init__(self, data_dir, tokenizer, max_length=128, bert_model_name="vinai/phobert-base"):
+    def __init__(self, data_dir, tokenizer, max_length=512, bert_model_name="vinai/phobert-base"):
         self.data_dir = data_dir
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -75,11 +75,11 @@ class ABSADataset(Dataset):
             for line in f:
                 try:
                     item = json.loads(line)
-                    # Chuyển đổi labels sang định dạng BIO
-                    bio_labels = self._convert_to_bio_labels(item['text'], item['labels'])
-                    # Chuyển đổi BIO labels sang ID
-                    item['labels'] = [self.sentiment_map[label.split('-')[1]] if label != "O" else 0 
-                                    for label in bio_labels]
+                    # Đảm bảo labels có độ dài bằng max_length
+                    if len(item['labels']) < self.max_length:
+                        item['labels'].extend([2] * (self.max_length - len(item['labels'])))  # Padding với O tag
+                    else:
+                        item['labels'] = item['labels'][:self.max_length]  # Cắt bớt nếu dài hơn
                     data.append(item)
                 except Exception as e:
                     logger.error(f"Lỗi khi xử lý dòng: {line.strip()}")
@@ -128,15 +128,9 @@ class ABSADataset(Dataset):
         labels = torch.tensor(item['labels'], dtype=torch.long)
         
         # Đảm bảo labels có cùng độ dài với input_ids
-        if len(labels) < self.max_length:
-            # Padding labels với -100 (ignore_index)
-            padding = torch.full((self.max_length - len(labels),), -100, dtype=torch.long)
-            labels = torch.cat([labels, padding])
-        else:
-            # Cắt labels nếu dài hơn max_length
-            labels = labels[:self.max_length]
+        assert len(labels) == len(input_ids), f"Labels length {len(labels)} != input_ids length {len(input_ids)}"
         
-        return input_embeds, attention_mask, labels 
+        return input_embeds, attention_mask, labels
 
     def collate_fn(self, batch: list) -> dict:
         """Hàm để gộp các mẫu thành batch.
