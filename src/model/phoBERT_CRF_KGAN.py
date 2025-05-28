@@ -102,49 +102,64 @@ class PhoBERT_CRF_KGAN(nn.Module):
         Returns:
             dict: Dictionary chứa loss và predictions
         """
-        # BERT encoding
-        bert_outputs = self.bert(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
-            return_dict=True
-        )
-        bert_hidden = bert_outputs.last_hidden_state  # [batch_size, seq_length, bert_hidden_size]
-        
-        # KG projection
-        kg_output = self.kg_projection(bert_hidden)
-        
-        # Combine BERT and KG outputs
-        combined = torch.cat([bert_hidden, kg_output], dim=-1)
-        
-        # BiLSTM
-        lstm_output, _ = self.lstm(combined)
-        lstm_output = self.dropout(lstm_output)
-        
-        # Classification
-        emissions = self.classifier(lstm_output)
-        
-        # Chuyển đổi batch dimension cho CRF
-        emissions = emissions.transpose(0, 1)  # [seq_len, batch_size, num_labels]
-        mask = attention_mask.bool().transpose(0, 1)  # [seq_len, batch_size]
-        
-        if labels is not None:
-            # Training mode
-            labels = labels.transpose(0, 1)  # [seq_len, batch_size]
-            loss = -self.crf(emissions, labels, mask=mask)
-            return type('Outputs', (), {
-                'loss': loss,
-                'logits': emissions.transpose(0, 1)  # Chuyển lại [batch_size, seq_len, num_labels]
-            })
-        else:
-            # Inference mode
-            predictions = self.crf.decode(emissions, mask=mask)
-            # Chuyển predictions về dạng list of lists
-            predictions = [pred for pred in zip(*predictions)]
-            return type('Outputs', (), {
-                'predictions': predictions,
-                'logits': emissions.transpose(0, 1)  # Chuyển lại [batch_size, seq_len, num_labels]
-            })
+        try:
+            # Validate input shapes
+            batch_size, seq_length = input_ids.shape
+            assert attention_mask.shape == (batch_size, seq_length), \
+                f"Attention mask shape {attention_mask.shape} != {(batch_size, seq_length)}"
+            if labels is not None:
+                assert labels.shape == (batch_size, seq_length), \
+                    f"Labels shape {labels.shape} != {(batch_size, seq_length)}"
+            
+            # BERT encoding
+            bert_outputs = self.bert(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                token_type_ids=token_type_ids,  # PhoBERT không sử dụng token_type_ids
+                return_dict=True
+            )
+            bert_hidden = bert_outputs.last_hidden_state  # [batch_size, seq_length, bert_hidden_size]
+            
+            # KG projection
+            kg_output = self.kg_projection(bert_hidden)  # [batch_size, seq_length, kg_hidden_size]
+            
+            # Combine BERT and KG outputs
+            combined = torch.cat([bert_hidden, kg_output], dim=-1)  # [batch_size, seq_length, bert_hidden_size + kg_hidden_size]
+            
+            # BiLSTM
+            lstm_output, _ = self.lstm(combined)  # [batch_size, seq_length, lstm_hidden_size * 2]
+            lstm_output = self.dropout(lstm_output)
+            
+            # Classification
+            emissions = self.classifier(lstm_output)  # [batch_size, seq_length, num_labels]
+            
+            # Chuyển đổi batch dimension cho CRF
+            emissions = emissions.transpose(0, 1)  # [seq_length, batch_size, num_labels]
+            mask = attention_mask.bool().transpose(0, 1)  # [seq_length, batch_size]
+            
+            if labels is not None:
+                # Training mode
+                labels = labels.transpose(0, 1)  # [seq_length, batch_size]
+                loss = -self.crf(emissions, labels, mask=mask)
+                return type('Outputs', (), {
+                    'loss': loss,
+                    'logits': emissions.transpose(0, 1),  # [batch_size, seq_length, num_labels]
+                    'predictions': self.crf.decode(emissions, mask=mask)  # List[List[int]]
+                })
+            else:
+                # Inference mode
+                predictions = self.crf.decode(emissions, mask=mask)  # List[List[int]]
+                return type('Outputs', (), {
+                    'predictions': predictions,
+                    'logits': emissions.transpose(0, 1)  # [batch_size, seq_length, num_labels]
+                })
+            
+        except Exception as e:
+            logger.error(f"Error in forward pass: {str(e)}")
+            logger.error(f"Input shapes: input_ids={input_ids.shape}, attention_mask={attention_mask.shape}")
+            if labels is not None:
+                logger.error(f"labels shape: {labels.shape}")
+            raise e
 
     def get_config(self) -> Dict[str, Any]:
         """Lấy cấu hình của model.

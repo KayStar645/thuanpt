@@ -11,10 +11,11 @@ from pathlib import Path
 from torch.optim import AdamW
 from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 from tqdm import tqdm
+from typing import Tuple, Dict
 
 from model.phoBERT_CRF_KGAN import PhoBERT_CRF_KGAN
 from utils.data_loader import ABSADataset
-from utils.metrics import compute_metrics
+from utils.metrics import compute_metrics, format_metrics
 from utils.training import set_seed, save_model, load_model
 
 def setup_logging(logging_config: dict) -> None:
@@ -49,7 +50,7 @@ def train_epoch(
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     device: torch.device,
     config: dict
-) -> float:
+) -> Tuple[float, Dict[str, float]]:
     """Training một epoch.
     
     Args:
@@ -61,88 +62,16 @@ def train_epoch(
         config: Cấu hình training
         
     Returns:
-        float: Loss trung bình của epoch
+        Tuple[float, Dict[str, float]]: (Loss trung bình, Metrics)
     """
     model.train()
     total_loss = 0
-    
-    progress_bar = tqdm(train_loader, desc="Training")
-    for step, batch in enumerate(progress_bar):
-        # Chuyển các tensor fields lên device
-        tensor_fields = ['input_ids', 'attention_mask', 'labels']
-        batch = {
-            k: v.to(device) if k in tensor_fields else v
-            for k, v in batch.items()
-        }
-        
-        # Forward pass
-        outputs = model(
-            input_ids=batch['input_ids'],
-            attention_mask=batch['attention_mask'],
-            labels=batch['labels']
-        )
-        loss = outputs.loss
-        
-        # Backward pass
-        loss.backward()
-        
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(
-            model.parameters(),
-            config['model']['max_grad_norm']
-        )
-        
-        # Update weights
-        optimizer.step()
-        scheduler.step()
-        optimizer.zero_grad()
-        
-        # Update progress bar
-        total_loss += loss.item()
-        progress_bar.set_postfix({
-            'loss': f"{loss.item():.4f}",
-            'avg_loss': f"{total_loss/(step+1):.4f}"
-        })
-        
-        # Log và lưu model
-        if (step + 1) % config['training']['logging_steps'] == 0:
-            logger.info(
-                f"Step {step+1}: loss = {loss.item():.4f}, "
-                f"avg_loss = {total_loss/(step+1):.4f}"
-            )
-        
-        if (step + 1) % config['training']['save_steps'] == 0:
-            save_model(
-                model,
-                optimizer,
-                scheduler,
-                step + 1,
-                config['data']['output_dir']
-            )
-    
-    return total_loss / len(train_loader)
-
-def evaluate(
-    model: PhoBERT_CRF_KGAN,
-    eval_loader: torch.utils.data.DataLoader,
-    device: torch.device
-) -> dict:
-    """Đánh giá model.
-    
-    Args:
-        model: Model cần đánh giá
-        eval_loader: DataLoader cho dữ liệu evaluation
-        device: Device để evaluate
-        
-    Returns:
-        dict: Các metrics đánh giá
-    """
-    model.eval()
     all_preds = []
     all_labels = []
     
-    with torch.no_grad():
-        for batch in tqdm(eval_loader, desc="Evaluating"):
+    progress_bar = tqdm(train_loader, desc="Training")
+    for step, batch in enumerate(progress_bar):
+        try:
             # Chuyển các tensor fields lên device
             tensor_fields = ['input_ids', 'attention_mask', 'labels']
             batch = {
@@ -153,16 +82,134 @@ def evaluate(
             # Forward pass
             outputs = model(
                 input_ids=batch['input_ids'],
-                attention_mask=batch['attention_mask']
+                attention_mask=batch['attention_mask'],
+                labels=batch['labels']
             )
-            preds = outputs.predictions
+            loss = outputs.loss
+            
+            # Backward pass
+            loss.backward()
+            
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                config['model']['max_grad_norm']
+            )
+            
+            # Update weights
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
             
             # Lưu predictions và labels
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(batch['labels'].cpu().numpy())
+            if hasattr(outputs, 'predictions'):
+                all_preds.extend(outputs.predictions)
+                all_labels.extend(batch['labels'].cpu().numpy())
+            
+            # Update progress bar
+            total_loss += loss.item()
+            progress_bar.set_postfix({
+                'loss': f"{loss.item():.4f}",
+                'avg_loss': f"{total_loss/(step+1):.4f}"
+            })
+            
+            # Log và lưu model
+            if (step + 1) % config['training']['logging_steps'] == 0:
+                # Tính metrics nếu có predictions
+                metrics = {}
+                if all_preds and all_labels:
+                    metrics = compute_metrics(all_preds, all_labels)
+                    logger.info(
+                        f"Step {step+1}: loss = {loss.item():.4f}, "
+                        f"avg_loss = {total_loss/(step+1):.4f}, "
+                        f"metrics = {format_metrics(metrics)}"
+                    )
+                else:
+                    logger.info(
+                        f"Step {step+1}: loss = {loss.item():.4f}, "
+                        f"avg_loss = {total_loss/(step+1):.4f}"
+                    )
+            
+            if (step + 1) % config['training']['save_steps'] == 0:
+                save_model(
+                    model,
+                    optimizer,
+                    scheduler,
+                    step + 1,
+                    config['data']['output_dir']
+                )
+                
+        except RuntimeError as e:
+            if "expanded size" in str(e):
+                logger.error(f"Tensor size mismatch at step {step}: {str(e)}")
+                logger.error("Skipping this batch...")
+                continue
+            raise e
+    
+    # Tính metrics cuối cùng cho epoch
+    final_metrics = {}
+    if all_preds and all_labels:
+        final_metrics = compute_metrics(all_preds, all_labels)
+    
+    return total_loss / len(train_loader), final_metrics
+
+def evaluate(
+    model: PhoBERT_CRF_KGAN,
+    eval_loader: torch.utils.data.DataLoader,
+    device: torch.device
+) -> Dict[str, float]:
+    """Đánh giá model.
+    
+    Args:
+        model: Model cần đánh giá
+        eval_loader: DataLoader cho dữ liệu evaluation
+        device: Device để evaluate
+        
+    Returns:
+        Dict[str, float]: Các metrics đánh giá
+    """
+    model.eval()
+    all_preds = []
+    all_labels = []
+    total_loss = 0
+    
+    with torch.no_grad():
+        for batch in tqdm(eval_loader, desc="Evaluating"):
+            try:
+                # Chuyển các tensor fields lên device
+                tensor_fields = ['input_ids', 'attention_mask', 'labels']
+                batch = {
+                    k: v.to(device) if k in tensor_fields else v
+                    for k, v in batch.items()
+                }
+                
+                # Forward pass
+                outputs = model(
+                    input_ids=batch['input_ids'],
+                    attention_mask=batch['attention_mask'],
+                    labels=batch['labels']
+                )
+                
+                # Lưu loss
+                if hasattr(outputs, 'loss'):
+                    total_loss += outputs.loss.item()
+                
+                # Lưu predictions và labels
+                if hasattr(outputs, 'predictions'):
+                    all_preds.extend(outputs.predictions)
+                    all_labels.extend(batch['labels'].cpu().numpy())
+                    
+            except RuntimeError as e:
+                if "expanded size" in str(e):
+                    logger.error(f"Tensor size mismatch during evaluation: {str(e)}")
+                    logger.error("Skipping this batch...")
+                    continue
+                raise e
     
     # Tính metrics
     metrics = compute_metrics(all_preds, all_labels)
+    metrics['loss'] = total_loss / len(eval_loader)
+    
     return metrics
 
 def main():
@@ -275,100 +322,53 @@ def main():
     patience_counter = 0
     
     for epoch in range(config['training']['num_epochs']):
-        logger.info(f"Epoch {epoch + 1}/{config['training']['num_epochs']}")
+        logger.info(f"\nEpoch {epoch + 1}/{config['training']['num_epochs']}")
         
         # Training
-        model.train()
-        total_loss = 0
+        train_loss, train_metrics = train_epoch(
+            model, train_dataloader, optimizer, scheduler, device, config
+        )
+        logger.info(f"\nTraining metrics for epoch {epoch + 1}:")
+        logger.info(f"Average loss: {train_loss:.4f}")
+        if train_metrics:
+            logger.info(f"Metrics: {format_metrics(train_metrics)}")
         
-        for step, batch in enumerate(train_dataloader):
-            # Chuyển các tensor fields lên device
-            tensor_fields = ['input_ids', 'attention_mask', 'labels']
-            batch = {
-                k: v.to(device) if k in tensor_fields else v
-                for k, v in batch.items()
-            }
-            
-            # Forward pass
-            outputs = model(
-                input_ids=batch['input_ids'],
-                attention_mask=batch['attention_mask'],
-                labels=batch['labels']
-            )
-            
-            loss = outputs.loss
-            total_loss += loss.item()
-            
-            # Backward pass
-            loss.backward()
-            
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(),
-                config['model']['max_grad_norm']
-            )
-            
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad()
-            
-            # Logging
-            if (step + 1) % config['training']['logging_steps'] == 0:
-                logger.info(
-                    f"Step {step + 1}/{len(train_dataloader)} - "
-                    f"Loss: {loss.item():.4f}"
-                )
-            
-            # Save checkpoint
-            if (step + 1) % config['training']['save_steps'] == 0:
-                save_model(
-                    model=model,
-                    output_dir=args.output_dir,
-                    step=step + 1,
-                    epoch=epoch + 1
-                )
-            
-            # Evaluation
-            if (step + 1) % config['training']['eval_steps'] == 0:
-                val_metrics = evaluate(model, val_dataloader, device)
-                logger.info(f"Validation metrics: {val_metrics}")
-                
-                # Early stopping
-                if val_metrics['f1'] > best_f1:
-                    best_f1 = val_metrics['f1']
-                    patience_counter = 0
-                    # Save best model
-                    save_model(
-                        model=model,
-                        output_dir=args.output_dir,
-                        step=step + 1,
-                        epoch=epoch + 1,
-                        is_best=True
-                    )
-                else:
-                    patience_counter += 1
-                    if patience_counter >= config['model']['early_stopping_patience']:
-                        logger.info("Early stopping triggered")
-                        return
-        
-        # End of epoch
-        avg_loss = total_loss / len(train_dataloader)
-        logger.info(f"Epoch {epoch + 1} - Average loss: {avg_loss:.4f}")
-        
-        # Final evaluation
+        # Evaluation
         val_metrics = evaluate(model, val_dataloader, device)
-        logger.info(f"Final validation metrics: {val_metrics}")
+        logger.info(f"\nValidation metrics for epoch {epoch + 1}:")
+        logger.info(f"Loss: {val_metrics['loss']:.4f}")
+        logger.info(f"Metrics: {format_metrics(val_metrics)}")
         
-        # Save final model
+        # Early stopping
+        if val_metrics['f1'] > best_f1:
+            best_f1 = val_metrics['f1']
+            patience_counter = 0
+            # Save best model
+            save_model(
+                model=model,
+                output_dir=args.output_dir,
+                step=len(train_dataloader),
+                epoch=epoch + 1,
+                is_best=True
+            )
+            logger.info(f"New best model saved! F1: {best_f1:.4f}")
+        else:
+            patience_counter += 1
+            logger.info(f"No improvement for {patience_counter} epochs")
+            if patience_counter >= config['model']['early_stopping_patience']:
+                logger.info("Early stopping triggered")
+                break
+        
+        # Save checkpoint
         save_model(
             model=model,
             output_dir=args.output_dir,
             step=len(train_dataloader),
-            epoch=epoch + 1,
-            is_final=True
+            epoch=epoch + 1
         )
     
-    logger.info("Training completed!")
+    logger.info("\nTraining completed!")
+    logger.info(f"Best F1 score: {best_f1:.4f}")
 
 if __name__ == "__main__":
     main()
