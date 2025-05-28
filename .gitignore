@@ -46,12 +46,12 @@ logs/
 *.db
 
 # Dữ liệu và model
-src/data/origin/*
-src/data/processed/*
-src/data/predictions/*
-!src/data/origin/.gitkeep
-!src/data/processed/.gitkeep
-!src/data/predictions/.gitkeep
+# src/data/origin/*
+# src/data/processed/*
+# src/data/predictions/*
+# !src/data/origin/.gitkeep
+# !src/data/processed/.gitkeep
+# !src/data/predictions/.gitkeep
 
 # Model đã huấn luyện
 *.pt
