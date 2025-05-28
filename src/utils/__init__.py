@@ -1,5 +1,5 @@
 """
-Module utils cho mô hình ABSA.
+Utils package cho model ABSA.
 """
 
 from .preprocess import preprocess_text

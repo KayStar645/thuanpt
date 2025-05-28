@@ -17,7 +17,7 @@ training:
   learning_rate: 1e-5
   weight_decay: 0.01
   num_epochs: 3
-  device: "cuda"  # hoặc "cpu"
+  device: "cpu"  # hoặc "cuda"
   num_workers: 4
   logging_steps: 100
   save_steps: 1000

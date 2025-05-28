@@ -9,8 +9,7 @@ import logging
 import argparse
 from pathlib import Path
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import get_linear_schedule_with_warmup
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 from tqdm import tqdm
 
 from model.phoBERT_CRF_KGAN import PhoBERT_CRF_KGAN

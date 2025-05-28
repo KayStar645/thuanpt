@@ -61,7 +61,7 @@ pip install -r requirements.txt
 ```bash
 python src/utils/preprocess.py \
     --input_file src/data/origin/train.jsonl \
-    --output_file src/data/processed/train.jsonl
+    --output_file src/data/processed/train_new.jsonl
 ```
 
 Các tham số tiền xử lý:
@@ -72,9 +72,8 @@ Các tham số tiền xử lý:
 3. Tạo tập validation:
 ```bash
 # Tách dữ liệu training thành train và validation
-head -n 500 src/data/processed/train.jsonl > src/data/processed/val.jsonl
-tail -n +1001 src/data/processed/train.jsonl > src/data/processed/train_new.jsonl
-mv src/data/processed/train_new.jsonl src/data/processed/train.jsonl
+head -n 500 src/data/processed/train_new.jsonl > src/data/processed/val.jsonl
+tail -n +501 src/data/processed/train_new.jsonl > src/data/processed/train.jsonl
 ```
 
 ## Training model
