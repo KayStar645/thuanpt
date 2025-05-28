@@ -13,7 +13,7 @@ from transformers import AutoTokenizer, get_linear_schedule_with_warmup
 from tqdm import tqdm
 
 from model.phoBERT_CRF_KGAN import PhoBERT_CRF_KGAN
-from data.dataset import ABSADataset, create_dataloader
+from utils.data_loader import ABSADataset
 from utils.metrics import compute_metrics
 from utils.training import set_seed, save_model, load_model
 
@@ -68,16 +68,18 @@ def train_epoch(
     
     progress_bar = tqdm(train_loader, desc="Training")
     for step, batch in enumerate(progress_bar):
-        # Chuyển batch lên device
-        input_ids = batch['input_ids'].to(device)
-        attention_mask = batch['attention_mask'].to(device)
-        labels = batch['labels'].to(device)
+        # Chuyển các tensor fields lên device
+        tensor_fields = ['input_ids', 'attention_mask', 'labels']
+        batch = {
+            k: v.to(device) if k in tensor_fields else v
+            for k, v in batch.items()
+        }
         
         # Forward pass
         outputs = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels
+            input_ids=batch['input_ids'],
+            attention_mask=batch['attention_mask'],
+            labels=batch['labels']
         )
         loss = outputs.loss
         
@@ -141,21 +143,23 @@ def evaluate(
     
     with torch.no_grad():
         for batch in tqdm(eval_loader, desc="Evaluating"):
-            # Chuyển batch lên device
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            labels = batch['labels'].to(device)
+            # Chuyển các tensor fields lên device
+            tensor_fields = ['input_ids', 'attention_mask', 'labels']
+            batch = {
+                k: v.to(device) if k in tensor_fields else v
+                for k, v in batch.items()
+            }
             
             # Forward pass
             outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask
+                input_ids=batch['input_ids'],
+                attention_mask=batch['attention_mask']
             )
             preds = outputs.predictions
             
             # Lưu predictions và labels
             all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
+            all_labels.extend(batch['labels'].cpu().numpy())
     
     # Tính metrics
     metrics = compute_metrics(all_preds, all_labels)
@@ -176,7 +180,20 @@ def main():
     with open(args.config, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
     
-    # Chuyển đổi kiểu dữ liệu cho các tham số training
+    # Convert string values to appropriate types
+    # Model config
+    model_config = config['model']
+    model_config['dropout'] = float(model_config['dropout'])
+    model_config['max_grad_norm'] = float(model_config['max_grad_norm'])
+    model_config['warmup_steps'] = int(model_config['warmup_steps'])
+    model_config['early_stopping_patience'] = int(model_config['early_stopping_patience'])
+    model_config['num_labels'] = int(model_config['num_labels'])
+    model_config['bert_hidden_size'] = int(model_config['bert_hidden_size'])
+    model_config['kg_hidden_size'] = int(model_config['kg_hidden_size'])
+    model_config['lstm_hidden_size'] = int(model_config['lstm_hidden_size'])
+    model_config['lstm_num_layers'] = int(model_config['lstm_num_layers'])
+    
+    # Training config
     training_config = config['training']
     training_config['learning_rate'] = float(training_config['learning_rate'])
     training_config['weight_decay'] = float(training_config['weight_decay'])
@@ -187,18 +204,6 @@ def main():
     training_config['save_steps'] = int(training_config['save_steps'])
     training_config['eval_steps'] = int(training_config['eval_steps'])
     training_config['max_length'] = int(training_config['max_length'])
-    
-    # Chuyển đổi kiểu dữ liệu cho các tham số model
-    model_config = config['model']
-    model_config['num_labels'] = int(model_config['num_labels'])
-    model_config['bert_hidden_size'] = int(model_config['bert_hidden_size'])
-    model_config['kg_hidden_size'] = int(model_config['kg_hidden_size'])
-    model_config['lstm_hidden_size'] = int(model_config['lstm_hidden_size'])
-    model_config['lstm_num_layers'] = int(model_config['lstm_num_layers'])
-    model_config['dropout'] = float(model_config['dropout'])
-    model_config['max_grad_norm'] = float(model_config['max_grad_norm'])
-    model_config['warmup_steps'] = int(model_config['warmup_steps'])
-    model_config['early_stopping_patience'] = int(model_config['early_stopping_patience'])
     
     # Set random seed
     set_seed(args.seed)
@@ -217,31 +222,34 @@ def main():
     # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(config['model']['bert_model_name'])
     
-    # Create datasets and dataloaders
+    # Create datasets
     train_dataset = ABSADataset(
-        data_file=args.train_file,
+        data_dir=os.path.dirname(args.train_file),
         tokenizer=tokenizer,
         max_length=config['training']['max_length']
     )
     
     val_dataset = ABSADataset(
-        data_file=args.val_file,
+        data_dir=os.path.dirname(args.val_file),
         tokenizer=tokenizer,
         max_length=config['training']['max_length']
     )
     
-    train_dataloader = create_dataloader(
+    # Create dataloaders
+    train_dataloader = torch.utils.data.DataLoader(
         dataset=train_dataset,
         batch_size=config['training']['batch_size'],
         shuffle=True,
-        num_workers=config['training']['num_workers']
+        num_workers=config['training']['num_workers'],
+        collate_fn=train_dataset.collate_fn
     )
     
-    val_dataloader = create_dataloader(
+    val_dataloader = torch.utils.data.DataLoader(
         dataset=val_dataset,
         batch_size=config['training']['batch_size'],
         shuffle=False,
-        num_workers=config['training']['num_workers']
+        num_workers=config['training']['num_workers'],
+        collate_fn=val_dataset.collate_fn
     )
     
     # Initialize model
@@ -274,8 +282,12 @@ def main():
         total_loss = 0
         
         for step, batch in enumerate(train_dataloader):
-            # Move batch to device
-            batch = {k: v.to(device) for k, v in batch.items()}
+            # Chuyển các tensor fields lên device
+            tensor_fields = ['input_ids', 'attention_mask', 'labels']
+            batch = {
+                k: v.to(device) if k in tensor_fields else v
+                for k, v in batch.items()
+            }
             
             # Forward pass
             outputs = model(

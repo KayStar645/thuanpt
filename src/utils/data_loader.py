@@ -84,7 +84,7 @@ class ABSADataset(Dataset):
                 except Exception as e:
                     logger.error(f"Lỗi khi xử lý dòng: {line.strip()}")
                     logger.error(f"Chi tiết lỗi: {str(e)}")
-                    raise
+                    continue
         
         return data
     
@@ -95,14 +95,15 @@ class ABSADataset(Dataset):
         """Lấy một mẫu dữ liệu.
         
         Returns:
-            tuple: (input_embeds, attention_mask, labels)
-                - input_embeds: Tensor chứa BERT embeddings [seq_len, hidden_size]
-                - attention_mask: Tensor mask [seq_len]
-                - labels: Tensor nhãn [seq_len]
+            dict: Dictionary chứa các tensor:
+                - input_ids: Token ids [max_length]
+                - attention_mask: Attention mask [max_length]
+                - labels: Labels [max_length]
+                - id: ID của mẫu
         """
         item = self.data[idx]
         
-        # Tokenize text
+        # Tokenize text với padding và truncation
         encoding = self.tokenizer(
             item['text'],
             max_length=self.max_length,
@@ -111,48 +112,60 @@ class ABSADataset(Dataset):
             return_tensors='pt'
         )
         
-        # Lấy input_ids và attention_mask
-        input_ids = encoding['input_ids'].squeeze(0)  # [seq_len]
-        attention_mask = encoding['attention_mask'].squeeze(0)  # [seq_len]
+        # Lấy các tensors và đảm bảo chúng có shape [max_length]
+        input_ids = encoding['input_ids'].squeeze(0)  # [max_length]
+        attention_mask = encoding['attention_mask'].squeeze(0)  # [max_length]
         
-        # Tạo BERT embeddings
-        with torch.no_grad():
-            outputs = self.bert_model(
-                input_ids=input_ids.unsqueeze(0),  # Thêm batch dimension
-                attention_mask=attention_mask.unsqueeze(0)
-            )
-            # Lấy embeddings từ layer cuối cùng
-            input_embeds = outputs.last_hidden_state.squeeze(0)  # [seq_len, hidden_size]
-        
-        # Chuyển đổi labels thành tensor
+        # Chuyển đổi labels thành tensor và đảm bảo độ dài
         labels = torch.tensor(item['labels'], dtype=torch.long)
+        if len(labels) < self.max_length:
+            labels = torch.nn.functional.pad(labels, (0, self.max_length - len(labels)), value=2)
+        else:
+            labels = labels[:self.max_length]
         
-        # Đảm bảo labels có cùng độ dài với input_ids
-        assert len(labels) == len(input_ids), f"Labels length {len(labels)} != input_ids length {len(input_ids)}"
+        # Đảm bảo tất cả tensors có cùng độ dài
+        assert len(input_ids) == self.max_length, f"input_ids length {len(input_ids)} != {self.max_length}"
+        assert len(attention_mask) == self.max_length, f"attention_mask length {len(attention_mask)} != {self.max_length}"
+        assert len(labels) == self.max_length, f"labels length {len(labels)} != {self.max_length}"
         
-        return input_embeds, attention_mask, labels
-
-    def collate_fn(self, batch: list) -> dict:
+        return {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            'labels': labels,
+            'id': item['id']
+        }
+    
+    def collate_fn(self, batch):
         """Hàm để gộp các mẫu thành batch.
         
         Args:
             batch (list): Danh sách các mẫu
             
         Returns:
-            dict: Dictionary chứa batched tensors
+            dict: Dictionary chứa batched tensors và non-tensor fields
         """
-        # Stack các tensors
-        input_ids = torch.stack([item[0] for item in batch])
-        attention_mask = torch.stack([item[1] for item in batch])
-        labels = torch.stack([item[2] for item in batch])
+        # Tách tensor fields và non-tensor fields
+        tensor_fields = ['input_ids', 'attention_mask', 'labels']
+        non_tensor_fields = ['id']
         
-        # Log batch shapes
-        logger.debug(f"Batch shapes - input_ids: {input_ids.shape}, "
-                    f"attention_mask: {attention_mask.shape}, "
-                    f"labels: {labels.shape}")
+        # Stack các tensors và đảm bảo chúng có cùng shape
+        tensor_batch = {}
+        for field in tensor_fields:
+            tensors = [item[field] for item in batch]
+            # Kiểm tra shape của mỗi tensor
+            for i, tensor in enumerate(tensors):
+                if tensor.shape[0] != self.max_length:
+                    raise ValueError(
+                        f"Tensor {field} at index {i} has length {tensor.shape[0]}, "
+                        f"expected {self.max_length}"
+                    )
+            tensor_batch[field] = torch.stack(tensors)
         
-        return {
-            'input_ids': input_ids,
-            'attention_mask': attention_mask,
-            'labels': labels
-        } 
+        # Giữ nguyên các non-tensor fields
+        non_tensor_batch = {
+            field: [item[field] for item in batch]
+            for field in non_tensor_fields
+        }
+        
+        # Kết hợp cả hai
+        return {**tensor_batch, **non_tensor_batch} 

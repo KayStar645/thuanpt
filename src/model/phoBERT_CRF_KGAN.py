@@ -84,29 +84,38 @@ class PhoBERT_CRF_KGAN(nn.Module):
         logger.info(f"- BiLSTM output size: {lstm_hidden_size * 2}")
         logger.info(f"- Number of labels: {num_labels}")
         
-    def forward(self, input_ids, attention_mask, labels=None):
-        """Forward pass.
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        token_type_ids: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None
+    ) -> dict:
+        """Forward pass của model.
         
         Args:
-            input_ids: Token ids [batch_size, seq_len]
-            attention_mask: Attention mask [batch_size, seq_len]
-            labels: Ground truth labels [batch_size, seq_len] (optional)
+            input_ids: Token ids [batch_size, seq_length]
+            attention_mask: Attention mask [batch_size, seq_length]
+            token_type_ids: Token type ids [batch_size, seq_length] (optional)
+            labels: Labels [batch_size, seq_length] (optional)
             
         Returns:
-            outputs: Model outputs
+            dict: Dictionary chứa loss và predictions
         """
         # BERT encoding
         bert_outputs = self.bert(
             input_ids=input_ids,
-            attention_mask=attention_mask
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            return_dict=True
         )
-        sequence_output = bert_outputs.last_hidden_state
+        bert_hidden = bert_outputs.last_hidden_state  # [batch_size, seq_length, bert_hidden_size]
         
         # KG projection
-        kg_output = self.kg_projection(sequence_output)
+        kg_output = self.kg_projection(bert_hidden)
         
         # Combine BERT and KG outputs
-        combined = torch.cat([sequence_output, kg_output], dim=-1)
+        combined = torch.cat([bert_hidden, kg_output], dim=-1)
         
         # BiLSTM
         lstm_output, _ = self.lstm(combined)
