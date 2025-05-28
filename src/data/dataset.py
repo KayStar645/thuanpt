@@ -6,7 +6,7 @@ import json
 from typing import Dict, List, Any, Optional
 from torch.utils.data import Dataset, DataLoader
 import torch
-from transformers import AutoTokenizer
+from transformers import PreTrainedTokenizer
 import logging
 
 logger = logging.getLogger(__name__)
@@ -25,7 +25,7 @@ class ABSADataset(Dataset):
     def __init__(
         self,
         data_file: str,
-        tokenizer_name: str = "vinai/phobert-base",
+        tokenizer: PreTrainedTokenizer,
         max_length: int = 512,
         label2id: Optional[Dict[str, int]] = None
     ):
@@ -33,11 +33,11 @@ class ABSADataset(Dataset):
         
         Args:
             data_file (str): Đường dẫn file dữ liệu đã xử lý
-            tokenizer_name (str): Tên model tokenizer
+            tokenizer (PreTrainedTokenizer): Tokenizer đã được khởi tạo
             max_length (int): Độ dài tối đa của sequence
             label2id (Optional[Dict[str, int]]): Mapping từ nhãn sang id
         """
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+        self.tokenizer = tokenizer
         self.max_length = max_length
         
         # Đọc dữ liệu
@@ -99,35 +99,22 @@ class ABSADataset(Dataset):
         }
 
 def create_dataloader(
-    data_file: str,
-    tokenizer_name: str = "vinai/phobert-base",
-    max_length: int = 512,
+    dataset: ABSADataset,
     batch_size: int = 32,
     shuffle: bool = True,
-    num_workers: int = 4,
-    label2id: Optional[Dict[str, int]] = None
+    num_workers: int = 4
 ) -> DataLoader:
     """Tạo dataloader cho dataset.
     
     Args:
-        data_file (str): Đường dẫn file dữ liệu
-        tokenizer_name (str): Tên model tokenizer
-        max_length (int): Độ dài tối đa của sequence
+        dataset (ABSADataset): Dataset đã được khởi tạo
         batch_size (int): Kích thước batch
         shuffle (bool): Có shuffle dữ liệu không
         num_workers (int): Số worker cho dataloader
-        label2id (Optional[Dict[str, int]]): Mapping từ nhãn sang id
         
     Returns:
         DataLoader: Dataloader cho dataset
     """
-    dataset = ABSADataset(
-        data_file=data_file,
-        tokenizer_name=tokenizer_name,
-        max_length=max_length,
-        label2id=label2id
-    )
-    
     return DataLoader(
         dataset,
         batch_size=batch_size,
